@@ -38,6 +38,14 @@ npm link          # puts the `xbmg` command on your PATH
 
 ## Sign in
 
+Run `xbmg`. When you are not signed in, it asks for your client ID, shows a
+code, and copies the code to your clipboard. Press Enter to open the sign-in
+page, enter the code, and sign in. The browser then loads your captures. If the
+client ID is wrong or the app registration needs a change, the screen tells you
+what to fix. Press `Ctrl-O` there to open the Microsoft Entra portal.
+
+You can also sign in with a command:
+
 ```sh
 xbmg login --client-id <your-application-client-id>
 ```
@@ -72,6 +80,7 @@ captures that you already downloaded.
 | `/` | Filter games by name |
 | `p` | Show or hide image previews |
 | `r` | Fetch the captures again |
+| `L` (twice) | Sign out, to use a different account |
 | `?` / `q` | Help / quit |
 
 The mouse wheel scrolls and a click selects a row.

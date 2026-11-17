@@ -203,6 +203,94 @@ describe('browser', () => {
     b.quit(true);
   });
 
+  it('asks for a client ID, shows the code, then loads the captures', async () => {
+    let finish;
+    const logins = [];
+    const copied = [];
+    const opened = [];
+    const { b, text } = makeBrowser({
+      login: { clientId: '' },
+      copy: async (t) => copied.push(t),
+      openUrl: async (u) => opened.push(u),
+      auth: {
+        login: (clientId, { onCode, onVerify }) => {
+          logins.push(clientId);
+          onCode({ userCode: 'ABCD-EFGH', verificationUri: 'https://www.microsoft.com/link', expiresIn: 900 });
+          return new Promise((r) => {
+            finish = () => {
+              onVerify();
+              r({ gamertag: 'Tester' });
+            };
+          });
+        },
+        signOut: async () => 'kept-id',
+      },
+    });
+    await b.start();
+    assert.equal(b.screen, 'login');
+    assert.ok(text().some((l) => l.includes('Client ID')));
+
+    b.input('nope!\r');
+    assert.equal(logins.length, 0);
+    assert.ok(text().some((l) => l.includes('That is not a client ID')));
+
+    b.input('\x15 1A2B3C4D-1a2b-1a2b-1a2b-1a2b3c4d5e6f\r');
+    assert.deepEqual(logins, ['1a2b3c4d-1a2b-1a2b-1a2b-1a2b3c4d5e6f']);
+    assert.ok(text().some((l) => l.includes('ABCD-EFGH')));
+    assert.deepEqual(copied, ['ABCD-EFGH']);
+
+    b.input('\r');
+    assert.deepEqual(opened, ['https://www.microsoft.com/link']);
+
+    finish();
+    await new Promise((r) => setTimeout(r, 10));
+    assert.equal(b.screen, 'browse');
+    assert.equal(b.gamertag, 'Tester');
+    assert.equal(b.items.length, 40);
+
+    b.input('LL');
+    await new Promise((r) => setTimeout(r, 10));
+    assert.equal(b.screen, 'login');
+    assert.equal(b.loginState.input, 'kept-id');
+    assert.equal(b.items.length, 0);
+    b.quit(true);
+  });
+
+  it('shows the sign-in error with advice and lets you try again', async () => {
+    const { b, text } = makeBrowser({
+      login: { clientId: '1a2b3c4d-1a2b-1a2b-1a2b-1a2b3c4d5e6f', auto: true },
+      auth: {
+        login: async () => {
+          throw new Error('Could not start sign-in: AADSTS700016: Application not found');
+        },
+      },
+    });
+    await b.start();
+    await new Promise((r) => setTimeout(r, 10));
+    assert.equal(b.loginState.step, 'clientId');
+    assert.ok(text().some((l) => l.includes('AADSTS700016')));
+    assert.ok(text().some((l) => l.includes('Personal Microsoft accounts')));
+    b.quit(true);
+  });
+
+  it('goes back to the sign-in screen when the saved sign-in fails', async () => {
+    const { b, text } = makeBrowser({
+      auth: { login: async () => ({}) },
+      loadData: async () => {
+        throw Object.assign(new Error('Your sign-in expired. Run "xbmg login" again. (invalid_grant)'), {
+          auth: true,
+          clientId: '1a2b3c4d-1a2b-1a2b-1a2b-1a2b3c4d5e6f',
+        });
+      },
+    });
+    await b.start();
+    assert.equal(b.screen, 'login');
+    assert.equal(b.loginState.input, '1a2b3c4d-1a2b-1a2b-1a2b-1a2b3c4d5e6f');
+    assert.ok(text().some((l) => l.includes('Your sign-in expired. (invalid_grant)')));
+    assert.ok(!text().some((l) => l.includes('xbmg login')));
+    b.quit(true);
+  });
+
   it('shows the error and retries with r', async () => {
     let calls = 0;
     const { b, text } = makeBrowser({
@@ -219,5 +307,51 @@ describe('browser', () => {
     assert.equal(calls, 2);
     assert.ok(text().some((l) => l.includes('No captures')));
     b.quit(true);
+  });
+});
+
+describe('device code sign-in', () => {
+  const realFetch = globalThis.fetch;
+  const reply = (status, body) => new Response(JSON.stringify(body), { status });
+
+  it('reports the code and URL, then returns the tokens', async (t) => {
+    t.after(() => {
+      globalThis.fetch = realFetch;
+    });
+    const { deviceCodeLogin } = await import('../src/auth.js');
+    let polls = 0;
+    globalThis.fetch = async (url) => {
+      if (String(url).endsWith('/devicecode')) {
+        return reply(200, { device_code: 'dc', user_code: 'ABCD-EFGH', verification_uri: 'https://www.microsoft.com/link', message: 'Go there', interval: 0.01, expires_in: 60 });
+      }
+      polls++;
+      return polls < 2 ? reply(400, { error: 'authorization_pending' }) : reply(200, { access_token: 'at', refresh_token: 'rt', expires_in: 3600 });
+    };
+    const seen = [];
+    const ms = await deviceCodeLogin('id', (message, info) => seen.push([message, info]));
+    assert.deepEqual(seen, [['Go there', { userCode: 'ABCD-EFGH', verificationUri: 'https://www.microsoft.com/link', expiresIn: 60 }]]);
+    assert.equal(ms.refreshToken, 'rt');
+    assert.equal(polls, 2);
+  });
+
+  it('stops when the signal aborts', async (t) => {
+    t.after(() => {
+      globalThis.fetch = realFetch;
+    });
+    const { deviceCodeLogin } = await import('../src/auth.js');
+    globalThis.fetch = async (url) =>
+      String(url).endsWith('/devicecode')
+        ? reply(200, { device_code: 'dc', user_code: 'X', verification_uri: 'u', interval: 0.05, expires_in: 60 })
+        : reply(400, { error: 'authorization_pending' });
+    const ctrl = new AbortController();
+    const job = deviceCodeLogin('id', () => ctrl.abort(), { signal: ctrl.signal });
+    await assert.rejects(job, { name: 'AbortError' });
+  });
+
+  it('gives advice for known errors', async () => {
+    const { authHint } = await import('../src/auth.js');
+    assert.match(authHint('AADSTS7000218: client_assertion'), /Allow public client flows/);
+    assert.match(authHint('AADSTS700016: not found'), /Personal Microsoft accounts/);
+    assert.equal(authHint('something else'), null);
   });
 });

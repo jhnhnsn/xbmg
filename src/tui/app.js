@@ -1,10 +1,14 @@
 /** Full-screen browser: games, captures and a preview with an inline image. */
 
+import { spawn } from 'node:child_process';
 import { stat } from 'node:fs/promises';
 import { relative, resolve } from 'node:path';
+import { AuthError, CLIENT_ID_RE, authHint, deviceCodeLogin, getXboxAuth } from '../auth.js';
 import { downloadOne, runPool, source, targetPath } from '../download.js';
 import { applyFilters, parseDate, parseKinds, summarizeGames } from '../filters.js';
 import { formatBytes } from '../format.js';
+import { fetchAll } from '../mediahub.js';
+import { clearSession, loadSession, saveSession } from '../session.js';
 import { ThumbCache, detectImageProtocol, fitCells, itermImage, kittyClear, kittyFree, kittyPlace, kittyTransmit } from './image.js';
 import { parseInput } from './keys.js';
 import { Line, R, fit, strWidth, style } from './text.js';
@@ -28,6 +32,10 @@ const S = {
   brand: style({ bg: COLOR.accent, fg: 16, bold: true }),
   tabOn: style({ bg: COLOR.accent, fg: 16, bold: true }),
   tabOff: style({ fg: COLOR.dim }),
+  field: style({ bg: COLOR.rowBg, fg: 231 }),
+  fieldCursor: style({ bg: COLOR.rowBg, fg: COLOR.accent }),
+  link: style({ fg: COLOR.accent, underline: true }),
+  code: style({ bg: COLOR.accent, fg: 16, bold: true }),
 };
 
 const KIND_TABS = [
@@ -63,8 +71,30 @@ const HELP = [
   ['/', 'Filter games by name'],
   ['p', 'Show or hide image previews'],
   ['r', 'Fetch the captures again'],
+  ['L', 'Sign out (to use a different account)'],
   ['q  Ctrl-C', 'Quit'],
 ];
+
+const PORTAL_URL = 'https://entra.microsoft.com/#view/Microsoft_AAD_RegisteredApps/ApplicationsListBlade';
+
+const LOGIN_HINTS = {
+  clientId: [
+    ['Enter', 'continue'],
+    ['Ctrl-O', 'open portal'],
+    ['Ctrl-U', 'clear'],
+    ['Esc', 'quit'],
+  ],
+  code: [
+    ['Enter', 'open browser'],
+    ['c', 'copy code'],
+    ['Esc', 'back'],
+    ['q', 'quit'],
+  ],
+  other: [
+    ['Esc', 'back'],
+    ['q', 'quit'],
+  ],
+};
 
 const SPINNER = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏';
 const pad2 = (n) => String(n).padStart(2, '0');
@@ -129,6 +159,50 @@ function centered(text, w, st = '') {
   return new Line(w).add('', '', left).add(text, st, w - left).done();
 }
 
+/** Draws content in a box of width w, centred in a cols x h area. */
+function centerBox(content, w, cols, h, title) {
+  const boxH = Math.min(h, content.length + 2);
+  const drawn = box(content, w, boxH, { title, focused: true });
+  const left = Math.floor((cols - w) / 2);
+  const top = Math.max(0, Math.floor((h - boxH) / 2));
+  const lines = Array.from({ length: h }, () => ' '.repeat(cols));
+  drawn.forEach((d, i) => {
+    lines[top + i] = `${' '.repeat(left)}${d}${' '.repeat(cols - left - w)}`;
+  });
+  return lines;
+}
+
+function pipeTo(cmd, args, text) {
+  return new Promise((done, fail) => {
+    const child = spawn(cmd, args, { stdio: ['pipe', 'ignore', 'ignore'] });
+    child.on('error', fail);
+    child.on('close', (code) => (code === 0 ? done() : fail(new Error(`${cmd} exited with ${code}`))));
+    child.stdin.end(text);
+  });
+}
+
+/** Copies text with the system clipboard tool. Rejects when none works. */
+async function copyNative(text) {
+  const tools =
+    process.platform === 'darwin'
+      ? [['pbcopy', []]]
+      : process.platform === 'win32'
+        ? [['clip', []]]
+        : [
+            ['wl-copy', []],
+            ['xclip', ['-selection', 'clipboard']],
+            ['xsel', ['--clipboard', '--input']],
+          ];
+  for (const [cmd, args] of tools) {
+    try {
+      return await pipeTo(cmd, args, text);
+    } catch {
+      // Try the next tool.
+    }
+  }
+  throw new Error('No clipboard tool found.');
+}
+
 export class Browser {
   constructor({
     write,
@@ -144,9 +218,14 @@ export class Browser {
     demo = false,
     checkLocal = true,
     initial = {},
+    auth = null,
+    copy = async () => {},
+    login = null,
   }) {
-    Object.assign(this, { write, size, loadData, thumbs, download, openUrl, outDir, hdr, jobs, protocol, demo });
+    Object.assign(this, { write, size, loadData, thumbs, download, openUrl, outDir, hdr, jobs, protocol, demo, auth, copy });
     this.shouldCheckLocal = checkLocal;
+    this.initialLogin = login;
+    this.screen = 'browse';
     this.items = [];
     this.games = [];
     this.visible = [];
@@ -182,17 +261,24 @@ export class Browser {
   // ---- data ----
 
   async start() {
+    if (this.initialLogin && this.auth) return this.showLogin(this.initialLogin);
     await this.load();
   }
 
-  async load() {
-    this.loading = true;
-    this.error = null;
+  startSpinner() {
+    clearInterval(this.spinner);
     this.spinFrame = 0;
     this.spinner = setInterval(() => {
       this.spinFrame++;
       this.render();
     }, 100);
+  }
+
+  async load() {
+    this.screen = 'browse';
+    this.loading = true;
+    this.error = null;
+    this.startSpinner();
     this.render();
     try {
       const { items, gamertag } = await this.loadData();
@@ -201,6 +287,11 @@ export class Browser {
       const ids = new Set(items.map((i) => i.id));
       for (const id of this.selected) if (!ids.has(id)) this.selected.delete(id);
     } catch (e) {
+      if (e.auth && this.auth) {
+        clearInterval(this.spinner);
+        this.loading = false;
+        return this.showLogin({ clientId: e.clientId, error: e.message });
+      }
       this.error = e.message;
     }
     clearInterval(this.spinner);
@@ -262,6 +353,7 @@ export class Browser {
       return;
     }
     if (ev.ctrl && ev.name === 'c') return this.quit(true);
+    if (this.screen === 'login') return this.loginKey(ev);
     if (this.loading) return ev.name === 'q' ? this.quit(true) : undefined;
     if (ev.name === 'mouse') return this.mouse(ev);
     if (this.mode === 'help') {
@@ -275,6 +367,7 @@ export class Browser {
       return;
     }
     if (ev.name !== 'q') this.confirmQuit = false;
+    if (ev.name !== 'L') this.confirmSignOut = false;
     if (ev.ctrl) {
       if (ev.name === 'u') this.move(-this.page());
       if (ev.name === 'd') this.move(this.page());
@@ -349,6 +442,9 @@ export class Browser {
         return;
       case '?':
         this.mode = 'help';
+        return;
+      case 'L':
+        this.signOut();
         return;
     }
   }
@@ -487,10 +583,131 @@ export class Browser {
       return;
     }
     this.closed = true;
+    this.loginAbort?.abort();
     clearInterval(this.spinner);
     clearTimeout(this.statusTimer);
     clearTimeout(this.previewTimer);
     this.finish(0);
+  }
+
+  // ---- sign-in ----
+
+  showLogin({ clientId = '', error = null, auto = false } = {}) {
+    this.screen = 'login';
+    this.loading = false;
+    this.mode = 'normal';
+    const message = error?.replace(/\s*Run "xbmg login"( again| first)?\./, '').trim() || null;
+    this.loginState = { step: 'clientId', input: clientId ?? '', error: message, hint: authHint(message ?? '') };
+    this.startSpinner();
+    if (auto && CLIENT_ID_RE.test(clientId)) this.startLogin();
+    this.render();
+  }
+
+  async startLogin() {
+    const s = this.loginState;
+    const clientId = s.input.trim().toLowerCase();
+    if (!CLIENT_ID_RE.test(clientId)) {
+      s.error = 'That is not a client ID. It looks like 1a2b3c4d-1a2b-1a2b-1a2b-1a2b3c4d5e6f.';
+      s.hint = null;
+      return;
+    }
+    this.loginAbort?.abort();
+    const ctrl = new AbortController();
+    this.loginAbort = ctrl;
+    Object.assign(s, { step: 'starting', clientId, error: null, hint: null, copied: false });
+    this.render();
+    try {
+      const { gamertag } = await this.auth.login(clientId, {
+        signal: ctrl.signal,
+        onCode: ({ userCode, verificationUri, expiresIn }) => {
+          if (ctrl.signal.aborted) return;
+          Object.assign(s, { step: 'code', userCode, verificationUri, expiresAt: Date.now() + expiresIn * 1000 });
+          this.copyCode();
+          this.render();
+        },
+        onVerify: () => {
+          if (ctrl.signal.aborted) return;
+          s.step = 'verifying';
+          this.render();
+        },
+      });
+      if (ctrl.signal.aborted || this.closed) return;
+      this.loginAbort = null;
+      this.flash(`Signed in as ${gamertag ?? 'unknown gamertag'}.`);
+      await this.load();
+    } catch (e) {
+      if (ctrl.signal.aborted || this.closed) return;
+      Object.assign(s, { step: 'clientId', input: clientId, error: e.message, hint: authHint(e.message) });
+      this.render();
+    }
+  }
+
+  async copyCode() {
+    const s = this.loginState;
+    try {
+      await this.copy(s.userCode);
+      s.copied = true;
+    } catch {
+      s.copied = false;
+    }
+    this.render();
+  }
+
+  loginKey(ev) {
+    const s = this.loginState;
+    if (s.step === 'clientId') {
+      if (ev.name === 'enter') return this.startLogin();
+      if (ev.name === 'escape') return this.quit(true);
+      if (ev.ctrl && ev.name === 'o') return this.openLink(PORTAL_URL);
+      if (ev.ctrl && ev.name === 'u') s.input = '';
+      else if (ev.name === 'backspace') s.input = s.input.slice(0, -1);
+      else if (ev.char && /[0-9a-f-]/i.test(ev.char) && s.input.length < 36) s.input += ev.char;
+      else return;
+      s.error = null;
+      s.hint = null;
+      return;
+    }
+    if (ev.name === 'escape') {
+      this.loginAbort?.abort();
+      this.loginAbort = null;
+      s.step = 'clientId';
+      return;
+    }
+    if (ev.name === 'q') return this.quit(true);
+    if (s.step !== 'code') return;
+    if (ev.name === 'enter' || ev.name === 'o') {
+      this.copyCode();
+      this.openLink(s.verificationUri);
+    } else if (ev.name === 'c') {
+      this.copyCode();
+    }
+  }
+
+  async openLink(url) {
+    try {
+      await this.openUrl(url);
+    } catch (e) {
+      this.flash(`Could not open the browser: ${e.message}. Open ${url} yourself.`, true);
+      this.render();
+    }
+  }
+
+  async signOut() {
+    if (!this.auth) return this.flash('Demo mode has no sign-in.', true);
+    if (this.downloading) return this.flash('Wait for the downloads to finish first.', true);
+    if (!this.confirmSignOut) {
+      this.confirmSignOut = true;
+      return this.flash('Press L again to sign out.');
+    }
+    this.confirmSignOut = false;
+    const clientId = await this.auth.signOut();
+    this.items = [];
+    this.selected.clear();
+    this.local.clear();
+    this.gamertag = null;
+    this.recompute();
+    this.flash('Signed out. The saved sign-in is deleted.');
+    this.showLogin({ clientId });
   }
 
   // ---- previews ----
@@ -549,7 +766,9 @@ export class Browser {
     }
     const lines = [this.header(cols)];
     const h = rows - 2;
-    if (this.loading || this.error || this.mode === 'help') {
+    if (this.screen === 'login') {
+      lines.push(...this.loginBody(cols, h));
+    } else if (this.loading || this.error || this.mode === 'help') {
       const body = this.loading ? this.loadingBody(cols, h) : this.error ? this.errorBody(cols, h) : this.helpBody(cols, h);
       lines.push(...body);
     } else {
@@ -618,12 +837,12 @@ export class Browser {
     l.add(' xbmg ', S.brand).add(' ');
     if (this.demo) l.add('DEMO ', S.yellow);
     if (this.gamertag) l.add(this.gamertag, S.bold).add('  ');
-    if (!this.loading) l.add(`${this.items.length} captures`, S.dim);
+    if (!this.loading && this.screen === 'browse') l.add(`${this.items.length} captures`, S.dim);
     if (this.selected.size) l.add(`  ${this.selected.size} selected`, S.pink);
     if (this.query && this.mode !== 'filter') l.add(`  filter: ${this.query}`, S.yellow);
     const tabs = KIND_TABS.map(([k, label]) => [k, ` ${label} `]);
     const tw = tabs.reduce((n, [, t]) => n + strWidth(t), 0) + 1;
-    if (l.room > tw) {
+    if (this.screen === 'browse' && l.room > tw) {
       l.add('', '', l.room - tw);
       for (const [k, t] of tabs) l.add(t, k === this.kind ? S.tabOn : S.tabOff);
     }
@@ -632,6 +851,16 @@ export class Browser {
 
   footer(cols) {
     const l = new Line(cols);
+    if (this.screen === 'login') {
+      if (this.status && Date.now() < this.status.until) {
+        return l.add(` ${this.status.text}`, this.status.error ? S.red : S.green).done();
+      }
+      l.add(' ');
+      for (const [k, label] of LOGIN_HINTS[this.loginState.step] ?? LOGIN_HINTS.other) {
+        l.add(k, S.accent).add(` ${label}  `, S.dim);
+      }
+      return l.done();
+    }
     if (this.mode === 'filter') {
       l.add(' / ', S.accentBold).add(this.query).add('▏', S.accent);
       const hint = 'Enter keep · Esc cancel ';
@@ -688,15 +917,57 @@ export class Browser {
     const keyW = 20;
     const content = HELP.map(([k, d]) => new Line(w - 2).add(' ').add(k, S.accent, keyW).add(d).done());
     content.push(' '.repeat(w - 2), new Line(w - 2).add(' Press any key to close.', S.dim).done());
-    const boxH = Math.min(h, content.length + 2);
-    const drawn = box(content, w, boxH, { title: 'Keys', focused: true });
-    const left = Math.floor((cols - w) / 2);
-    const top = Math.max(0, Math.floor((h - boxH) / 2));
-    const lines = Array.from({ length: h }, () => ' '.repeat(cols));
-    drawn.forEach((d, i) => {
-      lines[top + i] = `${' '.repeat(left)}${d}${' '.repeat(cols - left - w)}`;
-    });
-    return lines;
+    return centerBox(content, w, cols, h, 'Keys');
+  }
+
+  loginBody(cols, h) {
+    const s = this.loginState;
+    const w = Math.min(cols - 2, 78);
+    const iw = w - 2;
+    const blank = ' '.repeat(iw);
+    const text = (t, st = '', indent = 1) =>
+      wrap(t, iw - indent - 1).map((x) => new Line(iw).add(' '.repeat(indent)).add(x, st).done());
+    const spin = SPINNER[(this.spinFrame ?? 0) % SPINNER.length];
+    const lines = [blank];
+
+    if (s.step === 'clientId') {
+      lines.push(...text('xbmg signs in with your own Azure app registration, so no other service sees your data. Type or paste its Application (client) ID.'));
+      lines.push(blank);
+      const field = new Line(iw).add(' ').add('Client ID  ', S.bold).add(' ', S.field);
+      field.add(s.input, S.field).add('▏', S.fieldCursor).add(' '.repeat(Math.max(0, 36 - s.input.length)), S.field).add(' ', S.field);
+      lines.push(field.done(), blank);
+      if (s.error) lines.push(...text(s.error, S.red));
+      if (s.hint) lines.push(...text(s.hint, S.yellow));
+      if (s.error || s.hint) lines.push(blank);
+      lines.push(...text('No app registration yet? Press Ctrl-O to open the Microsoft Entra portal, then:', S.bold));
+      for (const step of [
+        '1. App registrations → New registration.',
+        '2. Account types: Personal Microsoft accounts only → Register.',
+        '3. Authentication → Allow public client flows: Yes. Select Save.',
+        '4. Overview → copy the Application (client) ID.',
+      ]) {
+        lines.push(...text(step, '', 3));
+      }
+      lines.push(...text('You do not need a client secret or API permissions.', S.dim, 3));
+    } else if (s.step === 'code') {
+      const left = Math.max(0, Math.round((s.expiresAt - Date.now()) / 1000));
+      lines.push(new Line(iw).add(' 1. Open ').add(s.verificationUri, S.link).done());
+      lines.push(new Line(iw).add(' 2. Enter this code:').done(), blank);
+      lines.push(centered(` ${s.userCode} `, iw, S.code), blank);
+      lines.push(...text('3. Sign in with the Microsoft account that has your Xbox profile.'));
+      lines.push(blank);
+      lines.push(
+        left > 0
+          ? new Line(iw).add(` ${spin} `, S.accent).add('Waiting for you to sign in…').add(`   The code expires in ${Math.floor(left / 60)}:${pad2(left % 60)}.`, S.dim).done()
+          : new Line(iw).add(' The code expired. Press Esc and try again.', S.red).done(),
+      );
+      if (s.copied) lines.push(new Line(iw).add(' The code is on your clipboard.', S.green).done());
+    } else {
+      const msg = s.step === 'verifying' ? 'Signing in to Xbox Live…' : 'Asking Microsoft for a sign-in code…';
+      lines.push(new Line(iw).add(` ${spin} `, S.accent).add(msg).done());
+    }
+    lines.push(blank);
+    return centerBox(lines, w, cols, h, 'Sign in to Xbox');
   }
 
   pane(p) {
@@ -843,10 +1114,33 @@ function realDeps(values, protocol) {
   };
   return {
     loadData: async () => {
-      const [{ getXboxAuth }, { fetchAll }] = await Promise.all([import('../auth.js'), import('../mediahub.js')]);
-      const xsts = await getXboxAuth();
-      const all = await fetchAll(['screenshot', 'clip']);
-      return { gamertag: xsts.gamertag, items: applyFilters(all, filters) };
+      try {
+        const xsts = await getXboxAuth();
+        const all = await fetchAll(['screenshot', 'clip']);
+        return { gamertag: xsts.gamertag, items: applyFilters(all, filters) };
+      } catch (e) {
+        if (e instanceof AuthError) {
+          e.auth = true;
+          e.clientId = (await loadSession().catch(() => null))?.clientId ?? '';
+        }
+        throw e;
+      }
+    },
+    auth: {
+      login: async (clientId, { onCode, onVerify, signal }) => {
+        const ms = await deviceCodeLogin(clientId, (_message, info) => onCode(info), { signal });
+        onVerify();
+        await saveSession({ clientId, ms });
+        const xsts = await getXboxAuth({ force: true });
+        return { gamertag: xsts.gamertag };
+      },
+      // Deletes the tokens but keeps the client ID, so the next sign-in needs only the code.
+      signOut: async () => {
+        const clientId = (await loadSession().catch(() => null))?.clientId ?? '';
+        await clearSession();
+        if (clientId) await saveSession({ clientId });
+        return clientId;
+      },
     },
     thumbs: new ThumbCache({ needPng: protocol === 'kitty' }),
     download: (item, dest) => downloadOne(item, dest, { hdr: !!values.hdr }),
@@ -859,6 +1153,14 @@ export async function runBrowser(values, { openUrl }) {
   const protocol = detectImageProtocol();
   const kinds = parseKinds(values.type);
   const deps = values.demo ? (await import('./demo.js')).demoDeps() : realDeps(values, protocol);
+  let login = null;
+  if (!values.demo) {
+    const session = await loadSession().catch(() => null);
+    if (!session?.ms?.refreshToken) {
+      const given = values['client-id'] || process.env.XBMG_CLIENT_ID || '';
+      login = { clientId: given || session?.clientId || '', auto: !!given };
+    }
+  }
   const browser = new Browser({
     write: (s) => stdout.write(s),
     size: () => ({ cols: stdout.columns || 80, rows: stdout.rows || 24 }),
@@ -868,6 +1170,9 @@ export async function runBrowser(values, { openUrl }) {
     jobs: Number(values.jobs) || 4,
     protocol,
     initial: { kind: kinds.length === 1 ? kinds[0] : 'all', game: values.game ?? '' },
+    login,
+    // Falls back to OSC 52, which asks the terminal itself to set the clipboard.
+    copy: (text) => copyNative(text).catch(() => stdout.write(`\x1b]52;c;${Buffer.from(text).toString('base64')}\x07`)),
     ...deps,
   });
 

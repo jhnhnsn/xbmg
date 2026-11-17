@@ -231,9 +231,6 @@ async function cmdDownload(values, ids) {
 
 async function cmdBrowse(values) {
   if (!process.stdin.isTTY || !process.stdout.isTTY) throw new Error('"xbmg browse" needs an interactive terminal.');
-  if (!values.demo && !(await loadSession())) {
-    throw new Error('You are not signed in. Run "xbmg login" first, or try "xbmg browse --demo".');
-  }
   const { runBrowser } = await import('./tui/app.js');
   return runBrowser(values, { openUrl: openInBrowser });
 }

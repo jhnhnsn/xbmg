@@ -14,9 +14,10 @@ const XSTS_ERRORS = {
   2148916238: 'This is a child account. An adult must add it to a Microsoft family group first.',
 };
 
-async function postForm(url, params) {
+async function postForm(url, params, signal) {
   const res = await fetch(url, {
     method: 'POST',
+    signal,
     headers: { 'content-type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams(params),
   });
@@ -52,26 +53,50 @@ function toMsToken(body, previousRefreshToken) {
   };
 }
 
-/** Interactive sign-in with the OAuth 2.0 device code flow. */
-export async function deviceCodeLogin(clientId, print) {
-  const start = await postForm(`${AUTHORITY}/devicecode`, { client_id: clientId, scope: SCOPE });
+/** A client ID is a GUID, for example 1a2b3c4d-1a2b-1a2b-1a2b-1a2b3c4d5e6f. */
+export const CLIENT_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** Turns a known sign-in error into advice. Returns null when there is none. */
+export function authHint(message = '') {
+  if (/AADSTS700016/.test(message)) {
+    return 'Check the client ID. The app registration must allow "Personal Microsoft accounts".';
+  }
+  if (/AADSTS7000218/.test(message)) {
+    return 'In the app registration, open Authentication and set "Allow public client flows" to Yes.';
+  }
+  if (/authorization_declined|declined/i.test(message)) return 'You declined the sign-in. Try again to continue.';
+  if (/expired_token|timed out/i.test(message)) return 'The code expired. Try again to get a new one.';
+  return null;
+}
+
+/**
+ * Interactive sign-in with the OAuth 2.0 device code flow. `print` gets the
+ * message to show and { userCode, verificationUri, expiresIn }. Pass an
+ * AbortSignal to cancel.
+ */
+export async function deviceCodeLogin(clientId, print, { signal } = {}) {
+  const start = await postForm(`${AUTHORITY}/devicecode`, { client_id: clientId, scope: SCOPE }, signal);
   if (!start.res.ok) {
     throw new AuthError(
       `Could not start sign-in: ${start.body.error_description || start.body.error || `HTTP ${start.res.status}`}`,
     );
   }
   const { device_code: deviceCode, message, interval = 5, expires_in: expiresIn = 900 } = start.body;
-  print(message);
+  print(message, { userCode: start.body.user_code, verificationUri: start.body.verification_uri, expiresIn });
 
   let waitMs = interval * 1000;
   const deadline = Date.now() + expiresIn * 1000;
   while (Date.now() < deadline) {
-    await sleep(waitMs);
-    const { res, body } = await postForm(`${AUTHORITY}/token`, {
-      grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
-      client_id: clientId,
-      device_code: deviceCode,
-    });
+    await sleep(waitMs, undefined, { signal });
+    const { res, body } = await postForm(
+      `${AUTHORITY}/token`,
+      {
+        grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
+        client_id: clientId,
+        device_code: deviceCode,
+      },
+      signal,
+    );
     if (res.ok) return toMsToken(body);
     if (body.error === 'authorization_pending') continue;
     if (body.error === 'slow_down') {
