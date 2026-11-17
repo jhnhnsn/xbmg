@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { describe, it } from 'node:test';
+import { afterEach, describe, it } from 'node:test';
 import { Browser, scrollFor } from '../src/tui/app.js';
 import { demoItems, makePng } from '../src/tui/demo.js';
 import { ThumbCache, detectImageProtocol, fitCells, kittyTransmit, pngSize } from '../src/tui/image.js';
@@ -104,6 +104,12 @@ describe('images', () => {
   });
 });
 
+// Every browser a test makes is closed afterwards, also when an assertion fails, so no timer keeps the run alive.
+const open = [];
+afterEach(() => {
+  for (const b of open.splice(0)) b.quit(true);
+});
+
 function makeBrowser({ cols = 120, rows = 30, protocol = 'kitty', items = demoItems(40, Date.parse('2026-11-17T12:00:00Z')), ...rest } = {}) {
   const out = [];
   const downloads = [];
@@ -122,6 +128,7 @@ function makeBrowser({ cols = 120, rows = 30, protocol = 'kitty', items = demoIt
     outDir: '/tmp/xbmg-test-out',
     ...rest,
   });
+  open.push(b);
   return { b, out, downloads, text: () => b.prev.map(plain) };
 }
 
@@ -203,56 +210,122 @@ describe('browser', () => {
     b.quit(true);
   });
 
-  it('asks for a client ID, shows the code, then loads the captures', async () => {
+  const ID = '1a2b3c4d-1a2b-1a2b-1a2b-1a2b3c4d5e6f';
+
+  function fakeAuth() {
+    const calls = [];
     let finish;
-    const logins = [];
-    const copied = [];
-    const opened = [];
-    const { b, text } = makeBrowser({
-      login: { clientId: '' },
-      copy: async (t) => copied.push(t),
-      openUrl: async (u) => opened.push(u),
-      auth: {
-        login: (clientId, { onCode, onVerify }) => {
-          logins.push(clientId);
-          onCode({ userCode: 'ABCD-EFGH', verificationUri: 'https://www.microsoft.com/link', expiresIn: 900 });
-          return new Promise((r) => {
-            finish = () => {
-              onVerify();
-              r({ gamertag: 'Tester' });
-            };
-          });
-        },
-        signOut: async () => 'kept-id',
+    const auth = {
+      login: (clientId, { method, onUrl, onCode, onVerify }) => {
+        calls.push([clientId, method]);
+        if (method === 'code') onCode({ userCode: 'ABCD-EFGH', verificationUri: 'https://www.microsoft.com/link', expiresIn: 900 });
+        else onUrl('https://login.example/authorize?x=1');
+        return new Promise((r) => {
+          finish = () => {
+            onVerify();
+            r({ gamertag: 'Tester' });
+          };
+        });
       },
-    });
+      signOut: async () => ID,
+    };
+    return { auth, calls, finish: () => finish() };
+  }
+
+  it('asks for a client ID, opens the browser, then loads the captures', async () => {
+    const opened = [];
+    const fake = fakeAuth();
+    const { b, text } = makeBrowser({ login: { clientId: '', auto: true }, openUrl: async (u) => opened.push(u), auth: fake.auth });
     await b.start();
-    assert.equal(b.screen, 'login');
+    assert.equal(b.loginState.step, 'clientId');
     assert.ok(text().some((l) => l.includes('Client ID')));
 
     b.input('nope!\r');
-    assert.equal(logins.length, 0);
+    assert.equal(fake.calls.length, 0);
     assert.ok(text().some((l) => l.includes('That is not a client ID')));
 
-    b.input('\x15 1A2B3C4D-1a2b-1a2b-1a2b-1a2b3c4d5e6f\r');
-    assert.deepEqual(logins, ['1a2b3c4d-1a2b-1a2b-1a2b-1a2b3c4d5e6f']);
-    assert.ok(text().some((l) => l.includes('ABCD-EFGH')));
-    assert.deepEqual(copied, ['ABCD-EFGH']);
+    b.input(`\x15 ${ID.toUpperCase()}\r`);
+    await new Promise((r) => setTimeout(r, 0));
+    assert.deepEqual(fake.calls, [[ID, 'browser']]);
+    assert.equal(b.loginState.step, 'browser');
+    assert.deepEqual(opened, ['https://login.example/authorize?x=1']);
+    assert.ok(text().some((l) => l.includes('Waiting for you to sign in in your web browser')));
 
-    b.input('\r');
-    assert.deepEqual(opened, ['https://www.microsoft.com/link']);
-
-    finish();
+    fake.finish();
     await new Promise((r) => setTimeout(r, 10));
     assert.equal(b.screen, 'browse');
     assert.equal(b.gamertag, 'Tester');
     assert.equal(b.items.length, 40);
 
-    b.input('LL');
+    assert.match(text()[0], /Signed in as Tester/);
+    b.input('L');
+    assert.ok(text().some((l) => l.includes('Sign in as a different user')));
+    b.input('o');
     await new Promise((r) => setTimeout(r, 10));
     assert.equal(b.screen, 'login');
-    assert.equal(b.loginState.input, 'kept-id');
+    assert.equal(b.loginState.step, 'ready');
+    assert.equal(b.loginState.clientId, ID);
+    assert.match(text()[0], /Not signed in/);
+    assert.equal(fake.calls.length, 1, 'sign-out does not open the browser by itself');
     assert.equal(b.items.length, 0);
+    b.quit(true);
+  });
+
+  it('waits for Enter before it opens the browser', async () => {
+    const fake = fakeAuth();
+    const { b, text } = makeBrowser({ login: {}, defaultClientId: ID, auth: fake.auth });
+    await b.start();
+    assert.equal(fake.calls.length, 0);
+    assert.ok(text().some((l) => l.includes('You are not signed in')));
+    b.input('\r');
+    await new Promise((r) => setTimeout(r, 0));
+    assert.deepEqual(fake.calls, [[ID, 'browser']]);
+    b.quit(true);
+  });
+
+  it('signs in as a different user from the account box', async () => {
+    const fake = fakeAuth();
+    const { b } = makeBrowser({ auth: fake.auth, defaultClientId: ID });
+    await b.start();
+    b.input('Ls');
+    await new Promise((r) => setTimeout(r, 10));
+    assert.equal(b.screen, 'login');
+    assert.deepEqual(fake.calls, [[ID, 'browser']]);
+    b.quit(true);
+  });
+
+  it('opens the browser at once when a default client ID exists', async () => {
+    const opened = [];
+    const fake = fakeAuth();
+    const { b, text } = makeBrowser({ login: { auto: true }, defaultClientId: ID, openUrl: async (u) => opened.push(u), auth: fake.auth });
+    await b.start();
+    await new Promise((r) => setTimeout(r, 0));
+    assert.deepEqual(fake.calls, [[ID, 'browser']]);
+    assert.equal(opened.length, 1);
+    assert.ok(!text().some((l) => l.includes('Client ID')));
+    b.quit(true);
+  });
+
+  it('switches to a code sign-in with d', async () => {
+    const copied = [];
+    const fake = fakeAuth();
+    const { b, text } = makeBrowser({ login: { auto: true }, defaultClientId: ID, copy: async (t) => copied.push(t), auth: fake.auth });
+    await b.start();
+    b.input('d');
+    await new Promise((r) => setTimeout(r, 0));
+    assert.deepEqual(fake.calls.at(-1), [ID, 'code']);
+    assert.ok(text().some((l) => l.includes('ABCD-EFGH')));
+    assert.deepEqual(copied, ['ABCD-EFGH']);
+    b.input('\x1b');
+    assert.equal(b.loginState.step, 'ready');
+    b.quit(true);
+  });
+
+  it('uses a code sign-in by default over SSH', async () => {
+    const fake = fakeAuth();
+    const { b } = makeBrowser({ login: { auto: true }, defaultClientId: ID, preferCode: true, auth: fake.auth });
+    await b.start();
+    assert.deepEqual(fake.calls, [[ID, 'code']]);
     b.quit(true);
   });
 
@@ -267,9 +340,9 @@ describe('browser', () => {
     });
     await b.start();
     await new Promise((r) => setTimeout(r, 10));
-    assert.equal(b.loginState.step, 'clientId');
+    assert.equal(b.loginState.step, 'ready');
     assert.ok(text().some((l) => l.includes('AADSTS700016')));
-    assert.ok(text().some((l) => l.includes('Personal Microsoft accounts')));
+    assert.ok(text().some((l) => l.includes('Check the client ID')));
     b.quit(true);
   });
 
@@ -285,7 +358,7 @@ describe('browser', () => {
     });
     await b.start();
     assert.equal(b.screen, 'login');
-    assert.equal(b.loginState.input, '1a2b3c4d-1a2b-1a2b-1a2b-1a2b3c4d5e6f');
+    assert.equal(b.loginState.clientId, '1a2b3c4d-1a2b-1a2b-1a2b-1a2b3c4d5e6f');
     assert.ok(text().some((l) => l.includes('Your sign-in expired. (invalid_grant)')));
     assert.ok(!text().some((l) => l.includes('xbmg login')));
     b.quit(true);
@@ -353,5 +426,187 @@ describe('device code sign-in', () => {
     assert.match(authHint('AADSTS7000218: client_assertion'), /Allow public client flows/);
     assert.match(authHint('AADSTS700016: not found'), /Personal Microsoft accounts/);
     assert.equal(authHint('something else'), null);
+  });
+});
+
+describe('browser sign-in', () => {
+  const realFetch = globalThis.fetch;
+  const visit = async (url) => {
+    const { get } = await import('node:http');
+    return new Promise((done, fail) => {
+      get(url, (res) => {
+        let body = '';
+        res.on('data', (c) => (body += c));
+        res.on('end', () => done({ status: res.statusCode, body }));
+      }).on('error', fail);
+    });
+  };
+
+  it('opens the authorize URL with PKCE, takes the redirect, and redeems the code', async (t) => {
+    t.after(() => {
+      globalThis.fetch = realFetch;
+    });
+    const { browserLogin } = await import('../src/auth.js');
+    let tokenRequest;
+    globalThis.fetch = async (url, init) => {
+      tokenRequest = Object.fromEntries(new URLSearchParams(String(init.body)));
+      return new Response(JSON.stringify({ access_token: 'at', refresh_token: 'rt', expires_in: 3600 }), { status: 200 });
+    };
+    let page;
+    const ms = await browserLogin('my-id', {
+      onUrl: async (url) => {
+        const u = new URL(url);
+        assert.equal(u.pathname, '/consumers/oauth2/v2.0/authorize');
+        assert.equal(u.searchParams.get('client_id'), 'my-id');
+        assert.equal(u.searchParams.get('code_challenge_method'), 'S256');
+        assert.match(u.searchParams.get('redirect_uri'), /^http:\/\/localhost:\d+$/);
+        const back = new URL(u.searchParams.get('redirect_uri').replace('localhost', '127.0.0.1'));
+        assert.equal((await visit(`${back}?state=wrong&code=evil`)).body.includes('out of date'), true);
+        back.search = new URLSearchParams({ state: u.searchParams.get('state'), code: 'the-code' });
+        visit(back.href).then((r) => {
+          page = r;
+        });
+      },
+    });
+    assert.equal(ms.refreshToken, 'rt');
+    assert.equal(tokenRequest.grant_type, 'authorization_code');
+    assert.equal(tokenRequest.code, 'the-code');
+    assert.ok(tokenRequest.code_verifier.length >= 43);
+    await new Promise((r) => setTimeout(r, 20));
+    assert.match(page.body, /You are signed in/);
+  });
+
+  it('reports an error that Microsoft sends back', async () => {
+    const { browserLogin } = await import('../src/auth.js');
+    const job = browserLogin('my-id', {
+      onUrl: async (url) => {
+        const u = new URL(url);
+        const back = new URL(u.searchParams.get('redirect_uri').replace('localhost', '127.0.0.1'));
+        back.search = new URLSearchParams({ state: u.searchParams.get('state'), error: 'access_denied', error_description: 'The user declined.' });
+        visit(back.href).catch(() => {});
+      },
+    });
+    await assert.rejects(job, /Sign-in failed: The user declined/);
+  });
+
+  it('stops when the signal aborts and closes the server', async () => {
+    const { browserLogin } = await import('../src/auth.js');
+    const ctrl = new AbortController();
+    let redirect;
+    const job = browserLogin('my-id', {
+      signal: ctrl.signal,
+      onUrl: (url) => {
+        redirect = new URL(url).searchParams.get('redirect_uri').replace('localhost', '127.0.0.1');
+        ctrl.abort();
+      },
+    });
+    await assert.rejects(job, { name: 'AbortError' });
+    await assert.rejects(visit(`${redirect}?code=x&state=y`));
+  });
+});
+
+describe('viewer and links', () => {
+  const now = new Date('2026-11-17T12:00:00');
+
+  it('reads when an Xbox link expires', async () => {
+    const { linkExpiry } = await import('../src/tui/app.js');
+    const later = new Date('2026-11-17T18:30:00');
+    assert.equal(linkExpiry(`https://x.example/a.mp4?sv=1&se=${encodeURIComponent(later.toISOString())}&sig=z`, now), '18:30');
+    assert.equal(linkExpiry('https://x.example/a.mp4?sig=z', now), null);
+    assert.equal(linkExpiry('not a url', now), null);
+  });
+
+  it('copies the links of the selection with y', async () => {
+    const copied = [];
+    const items = demoItems(5).map((i, n) => ({ ...i, url: `https://x.example/${n}.png?se=2099-01-01T00:00:00Z` }));
+    const { b, text } = makeBrowser({ items, copy: async (t) => copied.push(t) });
+    await b.start();
+    b.input('  y');
+    await new Promise((r) => setTimeout(r, 0));
+    assert.equal(copied.length, 1);
+    assert.equal(copied[0].split('\n').length, 2);
+    assert.match(text().at(-1), /Copied 2 links\. Xbox links stop working at/);
+  });
+
+  it('shows a screenshot full size and steps with the arrow keys', async () => {
+    const items = demoItems(6).filter((i) => i.kind === 'screenshot');
+    const fetched = [];
+    const { b, out, text } = makeBrowser({
+      items,
+      fetchFull: async (item) => {
+        fetched.push(item.id);
+        return makePng(64, 36, () => [200, 100, 50]);
+      },
+    });
+    await b.start();
+    b.input('\r');
+    assert.equal(b.mode, 'view');
+    await new Promise((r) => setTimeout(r, 10));
+    assert.ok(text().some((l) => l.includes('Screenshot')));
+    assert.match(b.plan.id, /^full:/);
+    assert.match(out.join(''), /\x1b_Ga=p,i=\d+,p=1,c=\d+,r=\d+/);
+    b.input('\x1b[C');
+    await new Promise((r) => setTimeout(r, 10));
+    assert.equal(fetched.length, 2);
+    assert.equal(b.itemIndex, 1);
+    b.input('\x1b');
+    assert.equal(b.mode, 'normal');
+  });
+
+  it('plays a clip with ffmpeg frames and pauses with Space', async () => {
+    const { EventEmitter } = await import('node:events');
+    const { PassThrough } = await import('node:stream');
+    const spawned = [];
+    const spawnFn = (cmd, args) => {
+      const p = new EventEmitter();
+      p.stdout = new PassThrough();
+      p.stderr = new PassThrough();
+      p.kill = () => p.emit('close', null);
+      spawned.push({ cmd, args, p });
+      return p;
+    };
+    const { VideoPlayer } = await import('../src/tui/video.js');
+    const writes = [];
+    const player = new VideoPlayer({
+      input: (from) => ['-ss', String(from), '-i', 'clip.mp4'],
+      audio: (from) => ['-ss', String(from), 'clip.mp4'],
+      protocol: 'kitty',
+      write: (s) => writes.push(s),
+      box: { row: 2, col: 2, cols: 40, rows: 12 },
+      size: { w: 4, h: 2 },
+      duration: 10,
+      spawnFn,
+    });
+    player.play();
+    assert.deepEqual(
+      spawned.map((s) => s.cmd),
+      ['ffmpeg', 'ffplay'],
+    );
+    assert.ok(spawned[0].args.includes('-re'));
+    assert.ok(spawned[0].args.includes('rgb24'));
+    spawned[0].p.stdout.write(Buffer.alloc(4 * 2 * 3 * 2));
+    await new Promise((r) => setTimeout(r, 5));
+    assert.equal(writes.length, 2);
+    assert.match(writes[0], /a=T,f=24,s=4,v=2,o=z,i=\d+,p=1,c=40,r=12/);
+    assert.ok(Math.abs(player.pos - 2 / 15) < 1e-9);
+    player.toggle();
+    assert.equal(player.playing, false);
+    player.seek(5);
+    const still = spawned.at(-1);
+    assert.ok(still.args.includes('-frames:v'));
+    assert.equal(still.args[still.args.indexOf('-ss') + 1], String(5 + 2 / 15));
+    player.close();
+  });
+
+  it('splits a JPEG stream into images', async () => {
+    const { jpegSplitter } = await import('../src/tui/video.js');
+    const got = [];
+    const feed = jpegSplitter((img) => got.push([...img]));
+    feed(Buffer.from([0x00, 0xff, 0xd8, 1, 2]));
+    feed(Buffer.from([0xff, 0xd9, 0xff, 0xd8, 3, 0xff, 0xd9]));
+    assert.deepEqual(got, [
+      [0xff, 0xd8, 1, 2, 0xff, 0xd9],
+      [0xff, 0xd8, 3, 0xff, 0xd9],
+    ]);
   });
 });

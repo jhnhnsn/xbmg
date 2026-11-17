@@ -1,7 +1,7 @@
 import { execFile } from 'node:child_process';
 import { resolve } from 'node:path';
 import { parseArgs } from 'node:util';
-import { AuthError, deviceCodeLogin, getXboxAuth } from './auth.js';
+import { AuthError, DEFAULT_CLIENT_ID, authHint, browserLogin, deviceCodeLogin, getXboxAuth, preferDeviceCode } from './auth.js';
 import { downloadOne, runPool, source, targetPath } from './download.js';
 import { applyFilters, parseDate, parseKinds, summarizeGames } from './filters.js';
 import { formatBytes } from './format.js';
@@ -13,7 +13,8 @@ const HELP = `xbmg - browse and download your Xbox screenshots and game clips
 Usage:
   xbmg                              Open the browser (when run in a terminal)
   xbmg browse [filters] [--demo]    Browse captures with previews, select, download
-  xbmg login [--client-id <id>]     Sign in with your Microsoft account
+  xbmg login [--client-id <id>]     Sign in with your Microsoft account in the browser
+             [--device-code]        Sign in with a code instead (for example over SSH)
   xbmg whoami                       Show the signed-in gamertag
   xbmg logout                       Delete the saved sign-in
   xbmg games                        List games with capture counts
@@ -55,6 +56,7 @@ const OPTIONS = {
   jobs: { type: 'string', short: 'j', default: '4' },
   'dry-run': { type: 'boolean' },
   'client-id': { type: 'string' },
+  'device-code': { type: 'boolean' },
   demo: { type: 'boolean' },
   debug: { type: 'boolean' },
   help: { type: 'boolean', short: 'h' },
@@ -115,11 +117,28 @@ async function loadCaptures(values, ids = []) {
 
 async function cmdLogin(values) {
   const existing = await loadSession();
-  const clientId = values['client-id'] || process.env.XBMG_CLIENT_ID || existing?.clientId;
+  const clientId = values['client-id'] || process.env.XBMG_CLIENT_ID || existing?.clientId || DEFAULT_CLIENT_ID;
   if (!clientId) {
     throw new Error('A client ID is necessary. Use "xbmg login --client-id <id>". See README.md for setup.');
   }
-  const ms = await deviceCodeLogin(clientId, (message) => out(`\n${message}\n`));
+  let ms;
+  try {
+    ms =
+      values['device-code'] || preferDeviceCode()
+        ? await deviceCodeLogin(clientId, (message) => out(`\n${message}\n`))
+        : await browserLogin(clientId, {
+            onUrl: async (url) => {
+              out('Opening the Microsoft sign-in page in your web browser…');
+              out(`If it does not open, open this link:\n\n  ${url}\n`);
+              out('If the browser shows an error, press Ctrl-C and run "xbmg login --device-code".');
+              await openInBrowser(url).catch(() => {});
+            },
+          });
+  } catch (e) {
+    const hint = authHint(e.message);
+    if (hint) e.message = `${e.message}\n${hint}`;
+    throw e;
+  }
   await saveSession({ clientId, ms });
   const xsts = await getXboxAuth({ force: true });
   out(`Signed in as ${xsts.gamertag ?? 'unknown gamertag'} (XUID ${xsts.xuid}).`);

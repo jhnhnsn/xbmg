@@ -2,11 +2,58 @@
 
 A command-line tool to browse and download your Xbox screenshots and game clips.
 
-It signs in to Xbox Live directly with your own Microsoft account and your own
-Azure app registration. No third-party service sees your data. It has no npm
-dependencies; it needs Node.js 20 or newer.
+It signs in to Xbox Live directly with your own Microsoft account. Your tokens
+go only from Microsoft to your computer, and no third-party service sees your
+data. It has no npm dependencies; it needs Node.js 20 or newer. Inline video
+needs [ffmpeg](https://ffmpeg.org) (`ffplay` for sound).
 
-## One-time setup: create an Azure app registration
+## Install
+
+```sh
+git clone https://github.com/jhnhnsn/xbmg.git
+cd xbmg
+npm link          # puts the `xbmg` command on your PATH
+# or run it directly with: node bin/xbmg.js <command>
+xbmg browse --demo   # try it with made-up captures, no sign-in needed
+```
+
+## Sign in
+
+Run `xbmg`. When you are not signed in, it says so. Press Enter, and it opens
+the Microsoft sign-in page in your web browser. Sign in with the account that
+has your Xbox profile, and the terminal loads your captures. The header then
+shows "Signed in as" and your gamertag. Press `L` to sign in as a different
+user or to sign out.
+
+On the sign-in screen, press `d` to sign in with a code instead of the browser,
+for example when the browser shows an error. Over SSH, the code is the default,
+because a browser on your own computer cannot reach the remote `localhost`.
+
+You can also sign in with a command:
+
+```sh
+xbmg login
+xbmg login --device-code    # sign in with a code instead
+```
+
+The tool saves the sign-in to `~/.config/xbmediagrabber/session.json` (file
+mode 600) and refreshes it automatically. After the first time, `xbmg login`
+alone is enough.
+
+### How the browser sign-in works
+
+The tool uses the OAuth 2.0 authorization code flow with PKCE. It starts a
+one-time web server on `127.0.0.1` (and `::1`) on a random port, and Microsoft
+sends your browser back to `http://localhost:<port>` after you sign in. The
+server accepts only a response with the random `state` value of that sign-in,
+and it stops after the sign-in. The tokens go only from Microsoft to your
+computer.
+
+### Use your own Azure app registration (optional)
+
+By default the tool uses the project's app registration. Its client ID is in
+`src/auth.js`; it is not a secret. To use your own registration instead, make
+one as below and pass `--client-id <id>`, or set `XBMG_CLIENT_ID`.
 
 Xbox Live accepts sign-ins only from a registered app. The registration is free
 and takes a few minutes.
@@ -17,43 +64,16 @@ and takes a few minutes.
 2. Open **App registrations** → **New registration**.
    - **Name:** `xbmediagrabber` (any name works)
    - **Supported account types:** *Personal Microsoft accounts only*
-   - **Redirect URI:** leave empty
+   - **Redirect URI:** select **Public client/native (mobile & desktop)** and
+     type `http://localhost`
    - Select **Register**.
 3. On the app page, open **Authentication** and set
    **Allow public client flows** to **Yes**. Select **Save**.
-   (If you do not see that switch, first select **Add a platform** →
-   **Mobile and desktop applications** and tick
-   `https://login.microsoftonline.com/common/oauth2/nativeclient`.)
+   (If you skipped the redirect URI, add it here: **Add a platform** →
+   **Mobile and desktop applications** → custom redirect URI `http://localhost`.)
 4. On **Overview**, copy the **Application (client) ID**.
 
 You do not need a client secret or any API permissions.
-
-## Install
-
-```sh
-cd xbmediagrabber
-npm link          # puts the `xbmg` command on your PATH
-# or run it directly with: node bin/xbmg.js <command>
-```
-
-## Sign in
-
-Run `xbmg`. When you are not signed in, it asks for your client ID, shows a
-code, and copies the code to your clipboard. Press Enter to open the sign-in
-page, enter the code, and sign in. The browser then loads your captures. If the
-client ID is wrong or the app registration needs a change, the screen tells you
-what to fix. Press `Ctrl-O` there to open the Microsoft Entra portal.
-
-You can also sign in with a command:
-
-```sh
-xbmg login --client-id <your-application-client-id>
-```
-
-The tool shows a code and a URL. Open the URL, enter the code, and sign in with
-the Microsoft account that has your Xbox profile. The tool saves the sign-in to
-`~/.config/xbmediagrabber/session.json` (file mode 600) and refreshes it
-automatically. After the first time, `xbmg login` alone is enough.
 
 ## Browse in the terminal
 
@@ -74,16 +94,36 @@ captures that you already downloaded.
 | `←` `→` / `h` `l` / `Tab` | Change pane |
 | `Space` | Select a capture (on a game: all its captures) |
 | `a` / `Esc` | Select all / clear the selection |
+| `Enter` / `v` | View the capture full size inside xbmg |
 | `d` | Download the selection, or the current capture |
-| `o` / `Enter` | Open the capture in your browser |
+| `y` | Copy the download link (of the selection, or the capture) |
+| `o` | Open the capture in your web browser |
 | `t` | Show all, screenshots or clips |
 | `/` | Filter games by name |
 | `p` | Show or hide image previews |
 | `r` | Fetch the captures again |
-| `L` (twice) | Sign out, to use a different account |
+| `L` | Account: sign in as a different user, or sign out |
 | `?` / `q` | Help / quit |
 
 The mouse wheel scrolls and a click selects a row.
+
+### Viewing captures
+
+`Enter` opens the capture inside xbmg. For a screenshot, `←` `→` show the
+previous and next capture. For a clip, `Space` plays and pauses, `←` `→` go
+back and forward 5 seconds, `m` turns the sound off and on, and `[` `]` show the
+previous and next capture. `y`, `d` and `o` work here too, and `Esc` closes the
+view.
+
+Clips play through ffmpeg at 15 frames per second and 640 pixels wide. Set
+`XBMG_VIDEO_WIDTH` for sharper video if your terminal keeps up. A downloaded
+clip plays from the file; other clips stream from Xbox.
+
+### Sharing links
+
+`y` copies the Xbox download link, which anyone can open. Xbox links are
+temporary: the message shows when the link stops working. To share a capture
+for longer, download it and share the file.
 
 Image previews work in terminals that support the kitty graphics protocol
 (kitty, Ghostty) or iTerm2 inline images (iTerm2, WezTerm). They do not work

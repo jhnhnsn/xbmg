@@ -82,15 +82,13 @@ function hsl(h, s, l) {
 }
 
 /** Draws a small landscape: sky, sun, two mountain ranges and a dark ground. */
-function scene(item) {
+function scene(item, w = 384, h = 216) {
   const r = rng(item.seed);
   const hue = item.hue + (r() - 0.5) * 40;
   const sunX = 0.15 + r() * 0.7;
   const sunY = 0.2 + r() * 0.3;
   const p1 = r() * 10;
   const p2 = r() * 10;
-  const w = 384;
-  const h = 216;
   return makePng(w, h, (x, y) => {
     const u = x / w;
     const v = y / h;
@@ -144,6 +142,12 @@ export function demoDeps() {
       return { gamertag: 'DemoPlayer', items: demoItems() };
     },
     thumbs: new ThumbCache({ dir: null, fetcher: async (item) => scene(item) }),
+    fetchFull: async (item) => scene(item, 1280, 720),
+    // A generated test picture stands in for the clip. It needs ffmpeg, like real clips.
+    videoSource: (item) => ({
+      input: (from) => ['-ss', String(from), '-f', 'lavfi', '-i', `testsrc2=size=1280x720:rate=30:duration=${item.duration}`],
+      audio: null,
+    }),
     download: async (item) => {
       await sleep(200 + Math.random() * 600);
       return { status: 'downloaded', bytes: item.size };

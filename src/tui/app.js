@@ -1,17 +1,39 @@
 /** Full-screen browser: games, captures and a preview with an inline image. */
 
 import { spawn } from 'node:child_process';
-import { stat } from 'node:fs/promises';
+import { readFile, stat } from 'node:fs/promises';
 import { relative, resolve } from 'node:path';
-import { AuthError, CLIENT_ID_RE, authHint, deviceCodeLogin, getXboxAuth } from '../auth.js';
+import {
+  AuthError,
+  CLIENT_ID_RE,
+  DEFAULT_CLIENT_ID,
+  authHint,
+  browserLogin,
+  deviceCodeLogin,
+  getXboxAuth,
+  preferDeviceCode,
+} from '../auth.js';
 import { downloadOne, runPool, source, targetPath } from '../download.js';
 import { applyFilters, parseDate, parseKinds, summarizeGames } from '../filters.js';
 import { formatBytes } from '../format.js';
 import { fetchAll } from '../mediahub.js';
 import { clearSession, loadSession, saveSession } from '../session.js';
-import { ThumbCache, detectImageProtocol, fitCells, itermImage, kittyClear, kittyFree, kittyPlace, kittyTransmit } from './image.js';
+import {
+  ThumbCache,
+  detectImageProtocol,
+  fitCells,
+  isPng,
+  itermImage,
+  kittyClear,
+  kittyFree,
+  kittyPlace,
+  kittyTransmit,
+  pngSize,
+  toPng,
+} from './image.js';
 import { parseInput } from './keys.js';
 import { Line, R, fit, strWidth, style } from './text.js';
+import { VideoPlayer } from './video.js';
 
 const COLOR = { accent: 75, pink: 212, green: 114, yellow: 221, red: 203, dim: 245, border: 239, focusBg: 24, rowBg: 236, headerBg: 235 };
 
@@ -46,32 +68,57 @@ const KIND_TABS = [
 
 const HINTS = [
   ['↑↓', 'move'],
-  ['←→', 'pane'],
-  ['space', 'select'],
+  ['Enter', 'view'],
+  ['Space', 'select'],
   ['d', 'download'],
+  ['y', 'copy link'],
   ['o', 'open'],
   ['t', 'type'],
   ['/', 'filter'],
+  ['L', 'account'],
   ['?', 'help'],
   ['q', 'quit'],
 ];
+
+const VIEW_HINTS = {
+  screenshot: [
+    ['← →', 'previous/next'],
+    ['y', 'copy link'],
+    ['d', 'download'],
+    ['o', 'open in browser'],
+    ['Esc', 'close'],
+  ],
+  clip: [
+    ['Space', 'play/pause'],
+    ['← →', '5 s'],
+    ['[ ]', 'previous/next'],
+    ['m', 'sound'],
+    ['y', 'copy link'],
+    ['d', 'download'],
+    ['Esc', 'close'],
+  ],
+};
+
+/** Widest video frame in pixels that the viewer asks ffmpeg for. Wider frames look sharper but need more terminal bandwidth. */
+const VIDEO_WIDTH = Number(process.env.XBMG_VIDEO_WIDTH) || 640;
 
 const HELP = [
   ['↑ ↓  j k', 'Move in the list'],
   ['PgUp PgDn  ^u ^d', 'Move one page'],
   ['g G  Home End', 'Go to the first or last item'],
   ['← →  h l  Tab', 'Change pane'],
-  ['Enter', 'Open the game, or open the capture'],
+  ['Enter  v', 'Open the game, or view the capture here'],
   ['Space', 'Select a capture (on a game: all its captures)'],
   ['a', 'Select all captures in the list, or none'],
   ['Esc', 'Clear the selection, then the filter'],
   ['d', 'Download the selection (or the current capture)'],
   ['o', 'Open the current capture in your browser'],
+  ['y', 'Copy the download link (of the selection, or the capture)'],
   ['t', 'Show all, screenshots or clips'],
   ['/', 'Filter games by name'],
   ['p', 'Show or hide image previews'],
   ['r', 'Fetch the captures again'],
-  ['L', 'Sign out (to use a different account)'],
+  ['L', 'Account: sign in as a different user, or sign out'],
   ['q  Ctrl-C', 'Quit'],
 ];
 
@@ -82,18 +129,26 @@ const LOGIN_HINTS = {
     ['Enter', 'continue'],
     ['Ctrl-O', 'open portal'],
     ['Ctrl-U', 'clear'],
+    ['Esc', 'back'],
+  ],
+  ready: [
+    ['Enter', 'sign in'],
+    ['d', 'use a code'],
+    ['i', 'client ID'],
     ['Esc', 'quit'],
+  ],
+  browser: [
+    ['Enter', 'open again'],
+    ['c', 'copy link'],
+    ['d', 'use a code'],
+    ['Esc', 'cancel'],
   ],
   code: [
     ['Enter', 'open browser'],
     ['c', 'copy code'],
-    ['Esc', 'back'],
-    ['q', 'quit'],
+    ['Esc', 'cancel'],
   ],
-  other: [
-    ['Esc', 'back'],
-    ['q', 'quit'],
-  ],
+  other: [['Esc', 'cancel']],
 };
 
 const SPINNER = '⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏';
@@ -127,6 +182,26 @@ function wrap(text, width) {
   }
   if (line) out.push(line);
   return out;
+}
+
+const mmss = (sec) => {
+  const t = Math.max(0, Math.floor(sec || 0));
+  return `${Math.floor(t / 60)}:${pad2(t % 60)}`;
+};
+
+const even = (n) => Math.max(2, Math.round(n / 2) * 2);
+
+/** When an Xbox (Azure Storage) link stops working, from its "se" parameter. Null when unknown. */
+export function linkExpiry(url, now = new Date()) {
+  try {
+    const t = Date.parse(new URL(url).searchParams.get('se') ?? '');
+    if (Number.isNaN(t)) return null;
+    const d = new Date(t);
+    const time = `${pad2(d.getHours())}:${pad2(d.getMinutes())}`;
+    return d.toDateString() === now.toDateString() ? time : formatDate(d.toISOString());
+  } catch {
+    return null;
+  }
 }
 
 /** Keeps `index` inside a window of `height` rows that starts at `scroll`. */
@@ -221,10 +296,28 @@ export class Browser {
     auth = null,
     copy = async () => {},
     login = null,
+    defaultClientId = '',
+    preferCode = false,
+    fetchFull = null,
+    convert = toPng,
+    videoSource = null,
+    canWrite = () => true,
   }) {
     Object.assign(this, { write, size, loadData, thumbs, download, openUrl, outDir, hdr, jobs, protocol, demo, auth, copy });
     this.shouldCheckLocal = checkLocal;
     this.initialLogin = login;
+    this.defaultClientId = defaultClientId;
+    this.preferCode = preferCode;
+    this.fetchFull = fetchFull ?? (async (item) => {
+      const res = await fetch(source(item).url);
+      if (!res.ok) throw new Error(`Download failed: HTTP ${res.status}`);
+      return Buffer.from(await res.arrayBuffer());
+    });
+    this.convert = convert;
+    this.videoSource = videoSource;
+    this.canWrite = canWrite;
+    this.fullCache = new Map();
+    this.view = null;
     this.screen = 'browse';
     this.items = [];
     this.games = [];
@@ -281,9 +374,10 @@ export class Browser {
     this.startSpinner();
     this.render();
     try {
-      const { items, gamertag } = await this.loadData();
+      const { items, gamertag, xuid } = await this.loadData();
       this.items = items;
       this.gamertag = gamertag;
+      this.xuid = xuid;
       const ids = new Set(items.map((i) => i.id));
       for (const id of this.selected) if (!ids.has(id)) this.selected.delete(id);
     } catch (e) {
@@ -343,6 +437,7 @@ export class Browser {
   resize() {
     this.prev = [];
     this.imageKey = null;
+    this.closePlayer(true);
     this.write(`\x1b[2J${this.protocol === 'kitty' ? kittyClear : ''}`);
     this.render();
   }
@@ -361,13 +456,14 @@ export class Browser {
       return;
     }
     if (this.mode === 'filter') return this.filterKey(ev);
+    if (this.mode === 'view') return this.viewKey(ev);
+    if (this.mode === 'account') return this.accountKey(ev);
     if (this.error) {
       if (ev.name === 'r') this.load();
       if (ev.name === 'q' || ev.name === 'escape') this.quit(true);
       return;
     }
     if (ev.name !== 'q') this.confirmQuit = false;
-    if (ev.name !== 'L') this.confirmSignOut = false;
     if (ev.ctrl) {
       if (ev.name === 'u') this.move(-this.page());
       if (ev.name === 'd') this.move(this.page());
@@ -406,10 +502,14 @@ export class Browser {
         return;
       case 'enter':
         if (this.focus === 'games') this.focus = 'items';
-        else this.open();
+        else this.openViewer();
         return;
+      case 'v':
+        return this.openViewer();
       case 'o':
         return this.open();
+      case 'y':
+        return this.copyLinks();
       case ' ':
         return this.toggleSelect();
       case 'a':
@@ -444,9 +544,141 @@ export class Browser {
         this.mode = 'help';
         return;
       case 'L':
-        this.signOut();
+        if (!this.auth) return this.flash('Demo mode has no account.', true);
+        this.mode = 'account';
         return;
     }
+  }
+
+  accountKey(ev) {
+    this.mode = 'normal';
+    if (ev.name === 's') this.signOut({ switchUser: true });
+    else if (ev.name === 'o') this.signOut();
+  }
+
+  // ---- viewer ----
+
+  openViewer() {
+    const item = this.current();
+    if (!item) return;
+    if (!this.protocol) {
+      return this.flash('Inline viewing needs kitty, Ghostty, WezTerm or iTerm2. Press o to open the capture in your browser.', true);
+    }
+    this.mode = 'view';
+    this.view = { item };
+    if (item.kind !== 'clip') this.loadFull(item);
+  }
+
+  closeViewer() {
+    this.closePlayer();
+    this.mode = 'normal';
+    this.view = null;
+    this.prev = [];
+  }
+
+  /** Stops the clip. With keep, the next render starts a new player at the same time (after a resize). */
+  closePlayer(keep = false) {
+    const player = this.view?.player;
+    if (!player) return;
+    player.close();
+    this.view.player = null;
+    if (keep) this.view.resume = { pos: player.pos, playing: player.playing, muted: player.muted };
+  }
+
+  viewStep(delta) {
+    const next = clamp(this.itemIndex + delta, 0, this.visible.length - 1);
+    if (next === this.itemIndex) return;
+    this.closePlayer();
+    this.itemIndex = next;
+    this.view = { item: this.current() };
+    if (this.view.item.kind !== 'clip') this.loadFull(this.view.item);
+  }
+
+  viewKey(ev) {
+    const { item, player } = this.view;
+    const clip = item.kind === 'clip';
+    switch (ev.name) {
+      case 'escape':
+      case 'q':
+      case 'v':
+        return this.closeViewer();
+      case '[':
+      case 'pageup':
+      case 'k':
+      case 'up':
+        return this.viewStep(-1);
+      case ']':
+      case 'pagedown':
+      case 'j':
+      case 'down':
+        return this.viewStep(1);
+      case 'left':
+        return clip ? player?.seek(-5) : this.viewStep(-1);
+      case 'right':
+        return clip ? player?.seek(5) : this.viewStep(1);
+      case ' ':
+        return player?.toggle();
+      case 'home':
+      case '0':
+        return player?.seek(-Infinity);
+      case 'm':
+        return player?.toggleMute();
+      case 'y':
+        return this.copyLinks([item]);
+      case 'd':
+        return this.downloadSelection([item]);
+      case 'o':
+        return this.open(item);
+    }
+  }
+
+  async loadFull(item) {
+    if (this.fullCache.has(item.id)) return;
+    const entry = { status: 'loading' };
+    this.fullCache.set(item.id, entry);
+    if (this.fullCache.size > 6) this.fullCache.delete(this.fullCache.keys().next().value);
+    try {
+      const raw = this.local.has(item.id)
+        ? await readFile(targetPath(this.outDir, item, { hdr: this.hdr })).catch(() => this.fetchFull(item))
+        : await this.fetchFull(item);
+      let data = raw;
+      if (!isPng(raw) || raw.length > 4_000_000) {
+        data = await this.convert(raw, 2400).catch(() => (this.protocol === 'iterm' || isPng(raw) ? raw : null));
+      }
+      if (!data) throw new Error('Could not convert the image to PNG (install ImageMagick or ffmpeg).');
+      Object.assign(entry, { status: 'ready', data, ...(pngSize(data) ?? { width: item.width, height: item.height }) });
+    } catch (e) {
+      Object.assign(entry, { status: 'error', error: e.message });
+    }
+    if (this.view?.item.id === item.id) this.render();
+  }
+
+  /** ffmpeg and ffplay inputs for a clip: the downloaded file when there is one, else the Xbox link. */
+  clipSource(item) {
+    if (this.videoSource) return this.videoSource(item);
+    const where = this.local.has(item.id) ? targetPath(this.outDir, item, { hdr: false }) : source(item).url;
+    return {
+      input: (from) => ['-ss', String(from), '-i', where],
+      audio: (from) => ['-ss', String(from), where],
+    };
+  }
+
+  // ---- links ----
+
+  async copyLinks(list) {
+    const items =
+      list ?? (this.selected.size ? this.items.filter((i) => this.selected.has(i.id)) : [this.current()].filter(Boolean));
+    const urls = items.map((i) => source(i, { hdr: this.hdr }).url).filter(Boolean);
+    if (!urls.length) return this.flash(this.demo ? 'Demo captures have no link.' : 'This capture has no link.', true);
+    try {
+      await this.copy(urls.join('\n'));
+    } catch (e) {
+      return this.flash(`Could not copy: ${e.message}`, true);
+    }
+    const until = linkExpiry(urls[0]);
+    const what = urls.length === 1 ? 'the link' : `${urls.length} links`;
+    this.flash(`Copied ${what}. ${until ? `Xbox links stop working at ${until}.` : 'Xbox links are temporary.'}`);
+    this.render();
   }
 
   filterKey(ev) {
@@ -536,8 +768,7 @@ export class Browser {
     this.statusTimer = setTimeout(() => this.render(), 4100);
   }
 
-  async open() {
-    const item = this.current();
+  async open(item = this.current()) {
     if (!item) return;
     try {
       await this.openUrl(source(item, { hdr: this.hdr }).url);
@@ -548,9 +779,9 @@ export class Browser {
     this.render();
   }
 
-  async downloadSelection() {
+  async downloadSelection(only) {
     if (this.downloading) return this.flash('A download is already running.', true);
-    const ids = this.selected.size ? this.selected : new Set([this.current()?.id].filter(Boolean));
+    const ids = only ? new Set(only.map((i) => i.id)) : this.selected.size ? this.selected : new Set([this.current()?.id].filter(Boolean));
     const list = this.items.filter((i) => ids.has(i.id));
     if (!list.length) return;
     const state = { total: list.length, done: 0, saved: 0, skipped: 0, failed: 0 };
@@ -582,6 +813,7 @@ export class Browser {
       this.flash('Downloads are running. Press q again to quit.', true);
       return;
     }
+    this.closePlayer();
     this.closed = true;
     this.loginAbort?.abort();
     clearInterval(this.spinner);
@@ -596,56 +828,75 @@ export class Browser {
     this.screen = 'login';
     this.loading = false;
     this.mode = 'normal';
+    const id = clientId || this.defaultClientId || '';
     const message = error?.replace(/\s*Run "xbmg login"( again| first)?\./, '').trim() || null;
-    this.loginState = { step: 'clientId', input: clientId ?? '', error: message, hint: authHint(message ?? '') };
+    this.loginState = {
+      step: id ? 'ready' : 'clientId',
+      clientId: id,
+      input: id && id !== this.defaultClientId ? id : '',
+      error: message,
+      hint: authHint(message ?? ''),
+    };
     this.startSpinner();
-    if (auto && CLIENT_ID_RE.test(clientId)) this.startLogin();
+    if (auto && CLIENT_ID_RE.test(id)) this.startLogin();
     this.render();
   }
 
-  async startLogin() {
+  async startLogin(method = this.preferCode ? 'code' : 'browser') {
     const s = this.loginState;
-    const clientId = s.input.trim().toLowerCase();
-    if (!CLIENT_ID_RE.test(clientId)) {
-      s.error = 'That is not a client ID. It looks like 1a2b3c4d-1a2b-1a2b-1a2b-1a2b3c4d5e6f.';
-      s.hint = null;
-      return;
+    if (s.step === 'clientId') {
+      const typed = s.input.trim().toLowerCase();
+      if (!CLIENT_ID_RE.test(typed)) {
+        s.error = 'That is not a client ID. It looks like 1a2b3c4d-1a2b-1a2b-1a2b-1a2b3c4d5e6f.';
+        s.hint = null;
+        return;
+      }
+      s.clientId = typed;
     }
+    const clientId = s.clientId;
     this.loginAbort?.abort();
     const ctrl = new AbortController();
     this.loginAbort = ctrl;
-    Object.assign(s, { step: 'starting', clientId, error: null, hint: null, copied: false });
+    Object.assign(s, { step: 'starting', method, error: null, hint: null, copied: false, url: null });
     this.render();
+    const live = () => !ctrl.signal.aborted && !this.closed;
     try {
       const { gamertag } = await this.auth.login(clientId, {
+        method,
         signal: ctrl.signal,
+        onUrl: async (url) => {
+          if (!live()) return;
+          Object.assign(s, { step: 'browser', url });
+          this.render();
+          await this.openLink(url);
+        },
         onCode: ({ userCode, verificationUri, expiresIn }) => {
-          if (ctrl.signal.aborted) return;
+          if (!live()) return;
           Object.assign(s, { step: 'code', userCode, verificationUri, expiresAt: Date.now() + expiresIn * 1000 });
-          this.copyCode();
+          this.copyText(userCode);
           this.render();
         },
         onVerify: () => {
-          if (ctrl.signal.aborted) return;
+          if (!live()) return;
           s.step = 'verifying';
           this.render();
         },
       });
-      if (ctrl.signal.aborted || this.closed) return;
+      if (!live()) return;
       this.loginAbort = null;
       this.flash(`Signed in as ${gamertag ?? 'unknown gamertag'}.`);
       await this.load();
     } catch (e) {
-      if (ctrl.signal.aborted || this.closed) return;
-      Object.assign(s, { step: 'clientId', input: clientId, error: e.message, hint: authHint(e.message) });
+      if (!live()) return;
+      Object.assign(s, { step: 'ready', error: e.message, hint: authHint(e.message) });
       this.render();
     }
   }
 
-  async copyCode() {
+  async copyText(text) {
     const s = this.loginState;
     try {
-      await this.copy(s.userCode);
+      await this.copy(text);
       s.copied = true;
     } catch {
       s.copied = false;
@@ -653,11 +904,23 @@ export class Browser {
     this.render();
   }
 
+  cancelLogin() {
+    this.loginAbort?.abort();
+    this.loginAbort = null;
+    this.loginState.step = 'ready';
+  }
+
   loginKey(ev) {
     const s = this.loginState;
     if (s.step === 'clientId') {
       if (ev.name === 'enter') return this.startLogin();
-      if (ev.name === 'escape') return this.quit(true);
+      if (ev.name === 'escape') {
+        if (!s.clientId) return this.quit(true);
+        s.step = 'ready';
+        s.error = null;
+        s.hint = null;
+        return;
+      }
       if (ev.ctrl && ev.name === 'o') return this.openLink(PORTAL_URL);
       if (ev.ctrl && ev.name === 'u') s.input = '';
       else if (ev.name === 'backspace') s.input = s.input.slice(0, -1);
@@ -667,19 +930,29 @@ export class Browser {
       s.hint = null;
       return;
     }
-    if (ev.name === 'escape') {
-      this.loginAbort?.abort();
-      this.loginAbort = null;
-      s.step = 'clientId';
+    if (s.step === 'ready') {
+      if (ev.name === 'enter' || ev.name === 'o') return this.startLogin('browser');
+      if (ev.name === 'd') return this.startLogin('code');
+      if (ev.name === 'i') {
+        Object.assign(s, { step: 'clientId', error: null, hint: null });
+        return;
+      }
+      if (ev.name === 'escape' || ev.name === 'q') return this.quit(true);
       return;
     }
+    if (ev.name === 'escape') return this.cancelLogin();
     if (ev.name === 'q') return this.quit(true);
-    if (s.step !== 'code') return;
-    if (ev.name === 'enter' || ev.name === 'o') {
-      this.copyCode();
-      this.openLink(s.verificationUri);
-    } else if (ev.name === 'c') {
-      this.copyCode();
+    if (s.step === 'browser') {
+      if (ev.name === 'enter' || ev.name === 'o') this.openLink(s.url);
+      else if (ev.name === 'c') this.copyText(s.url);
+      else if (ev.name === 'd') this.startLogin('code');
+    } else if (s.step === 'code') {
+      if (ev.name === 'enter' || ev.name === 'o') {
+        this.copyText(s.userCode);
+        this.openLink(s.verificationUri);
+      } else if (ev.name === 'c') {
+        this.copyText(s.userCode);
+      }
     }
   }
 
@@ -692,22 +965,19 @@ export class Browser {
     }
   }
 
-  async signOut() {
-    if (!this.auth) return this.flash('Demo mode has no sign-in.', true);
+  async signOut({ switchUser = false } = {}) {
     if (this.downloading) return this.flash('Wait for the downloads to finish first.', true);
-    if (!this.confirmSignOut) {
-      this.confirmSignOut = true;
-      return this.flash('Press L again to sign out.');
-    }
-    this.confirmSignOut = false;
     const clientId = await this.auth.signOut();
+    const who = this.gamertag;
     this.items = [];
     this.selected.clear();
     this.local.clear();
     this.gamertag = null;
+    this.xuid = null;
     this.recompute();
-    this.flash('Signed out. The saved sign-in is deleted.');
     this.showLogin({ clientId });
+    if (switchUser) this.startLogin('browser');
+    else this.flash(who ? `Signed out of ${who}.` : 'Signed out.');
   }
 
   // ---- previews ----
@@ -768,6 +1038,10 @@ export class Browser {
     const h = rows - 2;
     if (this.screen === 'login') {
       lines.push(...this.loginBody(cols, h));
+    } else if (this.mode === 'view' && this.view) {
+      lines.push(...this.viewBody(cols, h));
+    } else if (this.mode === 'account') {
+      lines.push(...this.accountBody(cols, h));
     } else if (this.loading || this.error || this.mode === 'help') {
       const body = this.loading ? this.loadingBody(cols, h) : this.error ? this.errorBody(cols, h) : this.helpBody(cols, h);
       lines.push(...body);
@@ -805,6 +1079,16 @@ export class Browser {
     }
     this.prev = lines;
     const touched = plan && changed.some((r) => r >= plan.row && r < plan.row + plan.rows);
+    if (plan?.external) {
+      // A video player draws this area itself. Remove other images once, then let it redraw.
+      const fresh = key !== this.imageKey;
+      if (fresh && this.protocol === 'kitty') out += kittyClear;
+      this.imageKey = key;
+      this.imageArea = [plan.row, plan.row + plan.rows];
+      this.write(`${out}\x1b[?2026l`);
+      if ((fresh || touched) && !plan.player.playing) plan.player.redraw();
+      return;
+    }
     if (!plan) {
       if (this.imageKey && this.protocol === 'kitty') out += kittyClear;
       this.imageKey = null;
@@ -836,7 +1120,8 @@ export class Browser {
     const l = new Line(cols, S.header);
     l.add(' xbmg ', S.brand).add(' ');
     if (this.demo) l.add('DEMO ', S.yellow);
-    if (this.gamertag) l.add(this.gamertag, S.bold).add('  ');
+    if (this.gamertag) l.add('Signed in as ', S.dim).add(this.gamertag, S.green).add('  ');
+    else if (this.screen === 'login') l.add('Not signed in', S.dim);
     if (!this.loading && this.screen === 'browse') l.add(`${this.items.length} captures`, S.dim);
     if (this.selected.size) l.add(`  ${this.selected.size} selected`, S.pink);
     if (this.query && this.mode !== 'filter') l.add(`  filter: ${this.query}`, S.yellow);
@@ -856,8 +1141,10 @@ export class Browser {
         return l.add(` ${this.status.text}`, this.status.error ? S.red : S.green).done();
       }
       l.add(' ');
-      for (const [k, label] of LOGIN_HINTS[this.loginState.step] ?? LOGIN_HINTS.other) {
-        l.add(k, S.accent).add(` ${label}  `, S.dim);
+      const st = this.loginState;
+      for (const [k, label] of LOGIN_HINTS[st.step] ?? LOGIN_HINTS.other) {
+        const text = st.step === 'clientId' && k === 'Esc' && !st.clientId ? 'quit' : label;
+        l.add(k, S.accent).add(` ${text}  `, S.dim);
       }
       return l.done();
     }
@@ -882,7 +1169,17 @@ export class Browser {
       return l.add(` ${this.status.text}`, this.status.error ? S.red : S.green).done();
     }
     l.add(' ');
-    for (const [k, label] of HINTS) {
+    const hints =
+      this.mode === 'view' && this.view
+        ? VIEW_HINTS[this.view.item.kind === 'clip' ? 'clip' : 'screenshot']
+        : this.mode === 'account'
+          ? [
+              ['s', 'different user'],
+              ['o', 'sign out'],
+              ['Esc', 'close'],
+            ]
+          : HINTS;
+    for (const [k, label] of hints) {
       if (l.room < strWidth(k) + strWidth(label) + 3) break;
       l.add(k, S.accent).add(` ${label}  `, S.dim);
     }
@@ -912,6 +1209,98 @@ export class Browser {
     return lines;
   }
 
+  accountBody(cols, h) {
+    const w = Math.min(cols - 2, 60);
+    const iw = w - 2;
+    const blank = ' '.repeat(iw);
+    const lines = [
+      blank,
+      new Line(iw).add(' Signed in as ').add(this.gamertag ?? 'unknown gamertag', S.green).done(),
+      ...(this.xuid ? [new Line(iw).add(` Xbox user ID ${this.xuid}`, S.dim).done()] : []),
+      blank,
+      new Line(iw).add(' s', S.accentBold).add('    Sign in as a different user').done(),
+      new Line(iw).add(' o', S.accentBold).add('    Sign out').done(),
+      blank,
+      new Line(iw).add(' Esc  Close', S.dim).done(),
+      blank,
+    ];
+    return centerBox(lines, w, cols, h, 'Account');
+  }
+
+  viewBody(cols, h) {
+    const { item } = this.view;
+    const clip = item.kind === 'clip';
+    const iw = cols - 2;
+    const imgRows = Math.max(1, h - 4);
+    const blank = ' '.repeat(iw);
+    const content = Array.from({ length: imgRows }, () => blank);
+    const mid = Math.floor(imgRows / 2);
+    // Screen rows: 0 is the header, 1 the top border, so the image area starts at row 2 and column 2.
+    const place = (pxW, pxH) => {
+      const f = fitCells(pxW, pxH, iw - 2, imgRows, this.cell.w, this.cell.h);
+      return { row: 2 + Math.floor((imgRows - f.rows) / 2), col: 2 + Math.floor((iw - 2 - f.cols) / 2), ...f };
+    };
+    let status;
+    if (clip) {
+      const pxW = item.width || 1920;
+      const pxH = item.height || 1080;
+      let player = this.view.player;
+      if (!player) {
+        const at = place(pxW, pxH);
+        const w = even(Math.min(VIDEO_WIDTH, at.cols * this.cell.w));
+        const src = this.clipSource(item);
+        player = new VideoPlayer({
+          input: src.input,
+          audio: src.audio,
+          protocol: this.protocol,
+          write: this.write,
+          canWrite: this.canWrite,
+          box: at,
+          size: { w, h: even((w * pxH) / pxW) },
+          duration: item.duration || 30,
+          onChange: () => this.render(),
+        });
+        const resume = this.view.resume;
+        this.view.resume = null;
+        if (resume) Object.assign(player, { pos: resume.pos, muted: resume.muted });
+        this.view.player = player;
+        setImmediate(() => {
+          if (this.view?.player !== player) return;
+          if (!resume || resume.playing) player.play();
+          else player.seek(0);
+        });
+      }
+      this.plan = { external: true, player, id: `video:${item.id}`, ...player.box };
+      if (player.error) content[mid] = centered(player.error, iw, S.red);
+      else if (!player.last) content[mid] = centered('Loading video…', iw, S.dim);
+      status = this.clipStatus(player, iw);
+    } else {
+      const entry = this.fullCache.get(item.id);
+      if (entry?.status === 'ready') this.plan = { id: `full:${item.id}`, entry, ...place(entry.width, entry.height) };
+      else if (entry?.status === 'error') content[mid] = centered(entry.error, iw, S.red);
+      else content[mid] = centered('Loading image…', iw, S.dim);
+      const l = new Line(iw).add(' ').add(item.width && item.height ? `${item.width} × ${item.height}` : '', S.dim);
+      l.add(`   ${formatBytes(source(item, { hdr: this.hdr }).size)}`, S.dim);
+      if (item.hdrUrl) l.add('   HDR', S.yellow);
+      if (this.local.has(item.id)) l.add('   ✓ saved', S.green);
+      status = l.done();
+    }
+    content.push(blank, status);
+    const title = `${item.game} · ${clip ? 'Game clip' : 'Screenshot'} · ${formatDate(item.date)}`;
+    return box(content, cols, h, { title, right: `${this.itemIndex + 1}/${this.visible.length}`, focused: true });
+  }
+
+  clipStatus(p, iw) {
+    const icon = p.playing ? '▶' : p.ended ? '■' : '❚❚';
+    const flags = p.noSound ? 'no sound' : p.muted ? 'muted' : '';
+    const l = new Line(iw).add(' ').add(icon, S.accentBold).add(` ${mmss(p.pos)} / ${mmss(p.duration)}  `);
+    const barW = Math.max(0, l.room - strWidth(flags) - 3);
+    const filled = Math.round(Math.min(1, p.pos / (p.duration || 1)) * barW);
+    l.add('━'.repeat(filled), S.accent).add('─'.repeat(barW - filled), S.border);
+    if (flags) l.add(`  ${flags}`, S.dim);
+    return l.done();
+  }
+
   helpBody(cols, h) {
     const w = Math.min(cols - 2, 76);
     const keyW = 20;
@@ -928,27 +1317,50 @@ export class Browser {
     const text = (t, st = '', indent = 1) =>
       wrap(t, iw - indent - 1).map((x) => new Line(iw).add(' '.repeat(indent)).add(x, st).done());
     const spin = SPINNER[(this.spinFrame ?? 0) % SPINNER.length];
+    const waiting = (msg) => new Line(iw).add(` ${spin} `, S.accent).add(msg).done();
     const lines = [blank];
+    const problems = () => {
+      if (s.error) lines.push(...text(s.error, S.red));
+      if (s.hint) lines.push(...text(s.hint, S.yellow));
+      if (s.error || s.hint) lines.push(blank);
+    };
 
     if (s.step === 'clientId') {
-      lines.push(...text('xbmg signs in with your own Azure app registration, so no other service sees your data. Type or paste its Application (client) ID.'));
+      lines.push(...text('Type or paste the Application (client) ID of your Azure app registration.'));
       lines.push(blank);
       const field = new Line(iw).add(' ').add('Client ID  ', S.bold).add(' ', S.field);
       field.add(s.input, S.field).add('▏', S.fieldCursor).add(' '.repeat(Math.max(0, 36 - s.input.length)), S.field).add(' ', S.field);
       lines.push(field.done(), blank);
-      if (s.error) lines.push(...text(s.error, S.red));
-      if (s.hint) lines.push(...text(s.hint, S.yellow));
-      if (s.error || s.hint) lines.push(blank);
+      problems();
       lines.push(...text('No app registration yet? Press Ctrl-O to open the Microsoft Entra portal, then:', S.bold));
       for (const step of [
         '1. App registrations → New registration.',
         '2. Account types: Personal Microsoft accounts only → Register.',
-        '3. Authentication → Allow public client flows: Yes. Select Save.',
-        '4. Overview → copy the Application (client) ID.',
+        '3. Authentication → Add a platform → Mobile and desktop applications. Add the redirect URI http://localhost.',
+        '4. Set "Allow public client flows" to Yes → Save.',
+        '5. Overview → copy the Application (client) ID.',
       ]) {
-        lines.push(...text(step, '', 3));
+        const [num, ...rest] = step.split(' ');
+        const body = wrap(rest.join(' '), iw - 7);
+        body.forEach((t, i) => lines.push(new Line(iw).add(i ? '      ' : `   ${num} `).add(t).done()));
       }
       lines.push(...text('You do not need a client secret or API permissions.', S.dim, 3));
+    } else if (s.step === 'ready') {
+      lines.push(...text('You are not signed in.', S.bold));
+      lines.push(...text('Sign in with the Microsoft account that has your Xbox profile.'));
+      lines.push(blank);
+      problems();
+      lines.push(new Line(iw).add(' Press ').add('Enter', S.accentBold).add(' to sign in with your web browser.').done());
+      if (s.clientId !== this.defaultClientId) {
+        lines.push(blank, new Line(iw).add(` Client ID ${s.clientId}. Press i to change it.`, S.dim).done());
+      }
+    } else if (s.step === 'browser') {
+      lines.push(waiting('Waiting for you to sign in in your web browser…'), blank);
+      lines.push(...text('Your browser shows the Microsoft sign-in page. Sign in with the account that has your Xbox profile, then come back here.'));
+      lines.push(blank);
+      lines.push(...text('Did the browser not open? Press Enter to try again, or c to copy the link.', S.dim));
+      lines.push(...text('Does the browser show an error? Press d to sign in with a code instead.', S.dim));
+      if (s.copied) lines.push(blank, ...text('The link is on your clipboard.', S.green));
     } else if (s.step === 'code') {
       const left = Math.max(0, Math.round((s.expiresAt - Date.now()) / 1000));
       lines.push(new Line(iw).add(' 1. Open ').add(s.verificationUri, S.link).done());
@@ -963,8 +1375,7 @@ export class Browser {
       );
       if (s.copied) lines.push(new Line(iw).add(' The code is on your clipboard.', S.green).done());
     } else {
-      const msg = s.step === 'verifying' ? 'Signing in to Xbox Live…' : 'Asking Microsoft for a sign-in code…';
-      lines.push(new Line(iw).add(` ${spin} `, S.accent).add(msg).done());
+      lines.push(waiting(s.step === 'verifying' ? 'Signing in to Xbox Live…' : 'Starting the sign-in…'));
     }
     lines.push(blank);
     return centerBox(lines, w, cols, h, 'Sign in to Xbox');
@@ -1117,7 +1528,7 @@ function realDeps(values, protocol) {
       try {
         const xsts = await getXboxAuth();
         const all = await fetchAll(['screenshot', 'clip']);
-        return { gamertag: xsts.gamertag, items: applyFilters(all, filters) };
+        return { gamertag: xsts.gamertag, xuid: xsts.xuid, items: applyFilters(all, filters) };
       } catch (e) {
         if (e instanceof AuthError) {
           e.auth = true;
@@ -1127,8 +1538,11 @@ function realDeps(values, protocol) {
       }
     },
     auth: {
-      login: async (clientId, { onCode, onVerify, signal }) => {
-        const ms = await deviceCodeLogin(clientId, (_message, info) => onCode(info), { signal });
+      login: async (clientId, { method, onUrl, onCode, onVerify, signal }) => {
+        const ms =
+          method === 'code'
+            ? await deviceCodeLogin(clientId, (_message, info) => onCode(info), { signal })
+            : await browserLogin(clientId, { onUrl, signal });
         onVerify();
         await saveSession({ clientId, ms });
         const xsts = await getXboxAuth({ force: true });
@@ -1158,7 +1572,7 @@ export async function runBrowser(values, { openUrl }) {
     const session = await loadSession().catch(() => null);
     if (!session?.ms?.refreshToken) {
       const given = values['client-id'] || process.env.XBMG_CLIENT_ID || '';
-      login = { clientId: given || session?.clientId || '', auto: !!given };
+      login = { clientId: given || session?.clientId || '' };
     }
   }
   const browser = new Browser({
@@ -1171,6 +1585,9 @@ export async function runBrowser(values, { openUrl }) {
     protocol,
     initial: { kind: kinds.length === 1 ? kinds[0] : 'all', game: values.game ?? '' },
     login,
+    defaultClientId: DEFAULT_CLIENT_ID,
+    preferCode: preferDeviceCode(),
+    canWrite: () => !stdout.writableNeedDrain,
     // Falls back to OSC 52, which asks the terminal itself to set the clipboard.
     copy: (text) => copyNative(text).catch(() => stdout.write(`\x1b]52;c;${Buffer.from(text).toString('base64')}\x07`)),
     ...deps,
