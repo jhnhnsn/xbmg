@@ -9,12 +9,22 @@ needs [ffmpeg](https://ffmpeg.org) (`ffplay` for sound).
 
 ## Install
 
+You need [Node.js](https://nodejs.org) 20 or newer.
+
+```sh
+npm install -g xbmg    # then run: xbmg
+npx xbmg               # or run it once without installing
+xbmg browse --demo     # try it with made-up captures, no sign-in needed
+```
+
+For inline video, also install ffmpeg (for example `brew install ffmpeg`).
+
+To run it from a clone instead:
+
 ```sh
 git clone https://github.com/jhnhnsn/xbmg.git
 cd xbmg
-npm link          # puts the `xbmg` command on your PATH
-# or run it directly with: node bin/xbmg.js <command>
-xbmg browse --demo   # try it with made-up captures, no sign-in needed
+node bin/xbmg.js       # or "npm link" to put xbmg on your PATH
 ```
 
 ## Sign in
@@ -201,4 +211,4 @@ xbmg open <id>                    Open a capture in your browser
 xbmg download [ids...] [filters]  Download captures
 ```
 
-Run `xbmg --help` for all options. Run `npm test` to run the tests.
+Run `xbmg --help` for all options. Run `npm test` in a clone to run the tests.

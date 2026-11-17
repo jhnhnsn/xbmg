@@ -1,16 +1,39 @@
 {
-  "name": "xbmediagrabber",
+  "name": "xbmg",
   "version": "0.1.0",
-  "description": "Browse and download your Xbox screenshots and game clips from the command line",
+  "description": "Browse, view and download your Xbox screenshots and game clips in the terminal, with inline previews",
+  "keywords": [
+    "xbox",
+    "screenshots",
+    "game-clips",
+    "xbox-live",
+    "tui",
+    "terminal",
+    "cli",
+    "kitty-graphics"
+  ],
+  "homepage": "https://github.com/jhnhnsn/xbmg#readme",
+  "bugs": {
+    "url": "https://github.com/jhnhnsn/xbmg/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jhnhnsn/xbmg.git"
+  },
+  "license": "MIT",
   "type": "module",
   "bin": {
-    "xbmg": "./bin/xbmg.js"
+    "xbmg": "bin/xbmg.js"
   },
+  "files": [
+    "bin/",
+    "src/"
+  ],
   "scripts": {
-    "test": "node --test"
+    "test": "node --test",
+    "prepublishOnly": "npm test"
   },
   "engines": {
     "node": ">=20"
-  },
-  "license": "MIT"
+  }
 }
