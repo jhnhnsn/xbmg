@@ -1,0 +1,16 @@
+{
+  "name": "xbmediagrabber",
+  "version": "0.1.0",
+  "description": "Browse and download your Xbox screenshots and game clips from the command line",
+  "type": "module",
+  "bin": {
+    "xbmg": "./bin/xbmg.js"
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT"
+}
