@@ -1,3 +1,4 @@
 node_modules/
 xbox-captures/
 *.part
+.ticket-loop-status
