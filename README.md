@@ -9,7 +9,13 @@ needs [ffmpeg](https://ffmpeg.org) (`ffplay` for sound).
 
 ## Install
 
-You need [Node.js](https://nodejs.org) 20 or newer.
+With [Homebrew](https://brew.sh) (it installs Node for you):
+
+```sh
+brew install jhnhnsn/tap/xbmg
+```
+
+With npm, you need [Node.js](https://nodejs.org) 20 or newer.
 
 ```sh
 npm install -g xbmg    # then run: xbmg
