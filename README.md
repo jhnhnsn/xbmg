@@ -36,8 +36,13 @@ To read the script before you run it:
 curl -fsSL https://raw.githubusercontent.com/jhnhnsn/xbmg/main/install.sh | less
 ```
 
-Run it again to upgrade. Set `XBMG_VERSION=v0.1.0` for a specific version, or
-`XBMG_INSTALL_DIR` for a different folder. To uninstall:
+Run it again to upgrade. To install a specific version:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/jhnhnsn/xbmg/main/install.sh | XBMG_VERSION=v0.1.0 sh
+```
+
+Set `XBMG_INSTALL_DIR` for a different folder. To uninstall:
 `rm -rf ~/.local/share/xbmg ~/.local/bin/xbmg`.
 
 For inline video, also install ffmpeg (for example `brew install ffmpeg`).

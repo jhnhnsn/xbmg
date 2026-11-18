@@ -59,6 +59,13 @@ latest_version() {
   printf '%s\n' "$tag"
 }
 
+# check_version V: refuse a version that could point outside the install dir.
+check_version() {
+  case $1 in
+    "" | */* | .* | v.*) die "bad version: '$1'" ;;
+  esac
+}
+
 main() {
   check_node
 
@@ -66,11 +73,13 @@ main() {
   bin_dir=${XBMG_BIN_DIR:-"$HOME/.local/bin"}
 
   tmp_dir=$(mktemp -d 2>/dev/null || mktemp -d -t xbmg)
-  trap 'rm -rf "$tmp_dir"' EXIT INT TERM
+  trap 'rm -rf "$tmp_dir"' EXIT
+  trap 'exit 1' INT TERM
 
   if [ -n "${XBMG_SOURCE_DIR:-}" ]; then
     [ -f "$XBMG_SOURCE_DIR/bin/xbmg.js" ] || die "XBMG_SOURCE_DIR has no bin/xbmg.js: $XBMG_SOURCE_DIR"
     version=${XBMG_VERSION:-local}
+    check_version "$version"
     say "Installing xbmg $version from $XBMG_SOURCE_DIR"
     mkdir -p "$tmp_dir/src"
     cp -R "$XBMG_SOURCE_DIR/bin" "$XBMG_SOURCE_DIR/src" "$tmp_dir/src/"
@@ -89,25 +98,46 @@ main() {
       v*) ;;
       *) version="v$version" ;;
     esac
+    check_version "$version"
     say "Installing xbmg $version"
     fetch "https://github.com/$REPO/archive/refs/tags/$version.tar.gz" "$tmp_dir/xbmg.tar.gz" ||
       die "could not download xbmg $version. Check that the tag exists."
     mkdir -p "$tmp_dir/x"
     tar -xzf "$tmp_dir/xbmg.tar.gz" -C "$tmp_dir/x" || die "could not extract the download."
-    unpacked=$(find "$tmp_dir/x" -mindepth 1 -maxdepth 1 -type d | head -n 1)
-    [ -n "$unpacked" ] && [ -f "$unpacked/bin/xbmg.js" ] || die "the download has no bin/xbmg.js."
+    unpacked=
+    for d in "$tmp_dir/x"/*; do
+      if [ -f "$d/bin/xbmg.js" ]; then
+        unpacked=$d
+        break
+      fi
+    done
+    [ -n "$unpacked" ] || die "the download has no bin/xbmg.js."
   fi
 
   mkdir -p "$install_dir" "$bin_dir"
   target="$install_dir/$version"
-  rm -rf "$target"
-  mv "$unpacked" "$target"
-  chmod +x "$target/bin/xbmg.js"
+  staged="$install_dir/.xbmg-new-$$"
+  backup="$install_dir/.xbmg-old-$$"
+  # Copy into the install dir first (this can cross file systems), then
+  # swap with renames, so a failure keeps the old install.
+  rm -rf "$staged"
+  mv "$unpacked" "$staged" || die "could not write to $install_dir."
+  chmod +x "$staged/bin/xbmg.js"
+  if [ -e "$target" ]; then
+    mv "$target" "$backup" || die "could not replace $target."
+  fi
+  if ! mv "$staged" "$target"; then
+    [ -e "$backup" ] && mv "$backup" "$target"
+    die "could not move xbmg into $target."
+  fi
+  rm -rf "$backup"
   ln -sf "$target/bin/xbmg.js" "$bin_dir/xbmg"
 
-  # Upgrade in place: remove the other version folders.
+  # Upgrade in place: remove other xbmg version folders. Only remove
+  # folders that hold bin/xbmg.js, so other files in a custom
+  # XBMG_INSTALL_DIR are safe.
   for old in "$install_dir"/*; do
-    if [ -d "$old" ] && [ "$old" != "$target" ]; then
+    if [ -d "$old" ] && [ "$old" != "$target" ] && [ -f "$old/bin/xbmg.js" ]; then
       say "Removing old version $(basename "$old")"
       rm -rf "$old"
     fi
@@ -134,7 +164,13 @@ main() {
 
   say ""
   say "Run: xbmg --help"
-  say "To uninstall: rm -rf $install_dir $bin_dir/xbmg"
+  if [ -z "${XBMG_INSTALL_DIR:-}" ]; then
+    remove_dir=$install_dir
+  else
+    # A custom dir can hold other files: name only this version's folder.
+    remove_dir=$target
+  fi
+  say "To uninstall: rm -rf \"$remove_dir\" \"$bin_dir/xbmg\""
 }
 
 main "$@"
