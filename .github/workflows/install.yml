@@ -1,0 +1,30 @@
+name: install
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  install:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: shellcheck
+        if: runner.os == 'Linux'
+        run: shellcheck install.sh
+      - name: Run install.sh from the checkout
+        env:
+          XBMG_SOURCE_DIR: ${{ github.workspace }}
+        run: sh install.sh
+      - name: xbmg --help
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          xbmg --help

@@ -23,6 +23,23 @@ npx xbmg               # or run it once without installing
 xbmg browse --demo     # try it with made-up captures, no sign-in needed
 ```
 
+With the install script, you need Node.js 20 or newer. It installs to
+`~/.local/share/xbmg` and links `~/.local/bin/xbmg`, with no `sudo`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/jhnhnsn/xbmg/main/install.sh | sh
+```
+
+To read the script before you run it:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/jhnhnsn/xbmg/main/install.sh | less
+```
+
+Run it again to upgrade. Set `XBMG_VERSION=v0.1.0` for a specific version, or
+`XBMG_INSTALL_DIR` for a different folder. To uninstall:
+`rm -rf ~/.local/share/xbmg ~/.local/bin/xbmg`.
+
 For inline video, also install ffmpeg (for example `brew install ffmpeg`).
 
 To run it from a clone instead:

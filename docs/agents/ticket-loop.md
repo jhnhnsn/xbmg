@@ -30,6 +30,7 @@ Test hooks:
 - `XBMG_IMAGES=kitty|iterm|none`: force the image protocol.
 - `XBMG_VIDEO_WIDTH`: inline video width.
 - `XBMG_CLIENT_ID` / `--client-id`: override the app registration.
+- `XBMG_SOURCE_DIR=<folder>` (install.sh): copy that local folder (a checkout) instead of downloading a tag; no network. Version name is `XBMG_VERSION`, else `local`.
 
 A test plan records each command, its exit code, and the output that shows the result.
 
